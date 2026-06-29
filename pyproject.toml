@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot_framework"
+version = "0.1.0"
+authors = [
+  { name="ITK Development", email="itk-rpa@mkb.aarhus.dk" },
+]
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "OpenOrchestrator == 3.*",
+    "oomtm[pdf] @ git+https://github.com/mtm-aarhus/oomtm.git@main",
+    "requests >= 2.31",
+    "Pillow == 10.*",
+]
+# NOTE: office/email conversion uses LibreOffice headless on the worker
+# (concurrency-safe; the default for all formats). The process auto-installs it
+# on first use (oomtm.pdf.ensure_libreoffice) — on Windows WITHOUT admin via an
+# MSI administrative install (msiexec /a, no UAC); winget/Chocolatey are only
+# fallbacks if that fails. First run downloads ~350 MB once. Override the source
+# MSI with LIBREOFFICE_MSI_URL (e.g. an internal mirror) or point at an existing
+# binary with LIBREOFFICE_PATH to skip install entirely. If install can't happen,
+# the document is marked 'error' with a note.
+# Higher-fidelity MS Office (COM) conversion for Word/PowerPoint is opt-in and
+# off by default (it's single-desktop / unsafe to run concurrently); enable per
+# machine with OOMTM_PREFER_MSOFFICE=1.
+
+[project.optional-dependencies]
+dev = [
+  "pylint",
+  "flake8"
+]
