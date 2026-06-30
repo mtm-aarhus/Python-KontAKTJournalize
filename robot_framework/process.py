@@ -328,51 +328,60 @@ def _generate_aktliste(oc, client, case_id, payload):
     case's SharePoint subfolder, and journalise both onto the GO case. Idempotent
     — stable filenames overwrite the previous aktliste, so re-running on every doc
     change just refreshes it. No callback (fire-and-forget derived artifact)."""
+    path = f"/api/v1/cases/{case_id}/aktliste/generated"
     go_case_no = str(payload.get("go_case_no") or "").strip()
     source_case_id = str(payload.get("source_case_id") or "").strip()
     case_title = str(payload.get("case_title") or "")
     oc.log_info(f"Aktliste case={case_id} sag={source_case_id} -> {go_case_no}")
     if not source_case_id:
         return
-    data = _kontakt_get(client, f"/api/v1/cases/{case_id}/aktliste?source_case_id={quote(source_case_id)}")
-    rows = data.get("rows") or []
-    sagsnummer = data.get("sagsnummer") or source_case_id
-    if not rows:
-        oc.log_info("Aktliste: ingen dokumenter — springer over.")
-        return
+    try:
+        data = _kontakt_get(client, f"/api/v1/cases/{case_id}/aktliste?source_case_id={quote(source_case_id)}")
+        rows = data.get("rows") or []
+        sagsnummer = data.get("sagsnummer") or source_case_id
+        content_token = data.get("content_token")
+        if not rows:
+            oc.log_info("Aktliste: ingen dokumenter — springer over.")
+            return
 
-    dato = datetime.now().strftime("%d-%m-%Y")
-    logo = os.path.join(os.path.dirname(__file__), "aak.jpg")
-    logo = logo if os.path.exists(logo) else None
-    xlsx_bytes = oomtm_reports.aktliste_xlsx(rows)
-    pdf_bytes = oomtm_reports.aktliste_pdf(rows, sagsnummer=sagsnummer, dato_string=dato, logo_path=logo)
+        dato = datetime.now().strftime("%d-%m-%Y")
+        logo = os.path.join(os.path.dirname(__file__), "aak.jpg")
+        logo = logo if os.path.exists(logo) else None
+        xlsx_bytes = oomtm_reports.aktliste_xlsx(rows)
+        pdf_bytes = oomtm_reports.aktliste_pdf(rows, sagsnummer=sagsnummer, dato_string=dato, logo_path=logo)
 
-    # Stable filenames so each regeneration overwrites the previous aktliste.
-    files = [(f"Aktliste - {sagsnummer}.xlsx", xlsx_bytes),
-             (f"Aktliste - {sagsnummer}.pdf", pdf_bytes)]
+        # Stable filenames so each regeneration overwrites the previous aktliste.
+        files = [(f"Aktliste - {sagsnummer}.xlsx", xlsx_bytes),
+                 (f"Aktliste - {sagsnummer}.pdf", pdf_bytes)]
 
-    # SharePoint target: the GO/Nova case's delivery subfolder (the same path the
-    # share + to-PDF robots use). It exists already — KontAKT only enqueues this
-    # once files have been delivered there.
-    overmappe = sp.sanitize_segment(f"{case_id} - {case_title}")[:120].strip() or str(case_id)
-    undermappe = sp.sanitize_segment(source_case_id)[:80].strip() or "ukendt-sag"
-    sp_folder = sp.build_server_relative_path(client.sp_site_url, LIBRARY, overmappe, undermappe)
+        # SharePoint target: the GO/Nova case's delivery subfolder (the same path
+        # the share + to-PDF robots use). It exists already — KontAKT only enqueues
+        # this once files have been delivered there.
+        overmappe = sp.sanitize_segment(f"{case_id} - {case_title}")[:120].strip() or str(case_id)
+        undermappe = sp.sanitize_segment(source_case_id)[:80].strip() or "ukendt-sag"
+        sp_folder = sp.build_server_relative_path(client.sp_site_url, LIBRARY, overmappe, undermappe)
 
-    created_folders: set = set()
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, blob in files:
-            local = os.path.join(tmp, _safe_name(name))
-            with open(local, "wb") as fh:
-                fh.write(blob)
-            sp.upload_file(client.sp_ctx, folder_path=sp_folder, local_file=local, overwrite=True)
-            meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Internt")
-            go_doc_id = oomtm_go.upload_document(
-                client.go_session, base_url=client.go_url, case_id=go_case_no,
-                file_bytes=blob, file_name=name, metadata_xml=meta,
-                folder_path=undermappe, created_folders=created_folders,
-            )
-            if go_doc_id:
-                oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=[go_doc_id])
+        created_folders: set = set()
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, blob in files:
+                local = os.path.join(tmp, _safe_name(name))
+                with open(local, "wb") as fh:
+                    fh.write(blob)
+                sp.upload_file(client.sp_ctx, folder_path=sp_folder, local_file=local, overwrite=True)
+                meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Internt")
+                go_doc_id = oomtm_go.upload_document(
+                    client.go_session, base_url=client.go_url, case_id=go_case_no,
+                    file_bytes=blob, file_name=name, metadata_xml=meta,
+                    folder_path=undermappe, created_folders=created_folders,
+                )
+                if go_doc_id:
+                    oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=[go_doc_id])
+    except Exception as exc:  # pylint: disable=broad-except
+        oc.log_info(f"Aktliste failed: {exc!r}")
+        _callback(oc, client, path, {"ok": False, "source_case_id": source_case_id, "note": str(exc)[:400]})
+        raise
+    # Tell KontAKT which content the aktliste now reflects, so it counts as current.
+    _callback(oc, client, path, {"ok": True, "source_case_id": source_case_id, "content_token": content_token})
     oc.log_info(f"Aktliste opdateret for {sagsnummer}: {len(rows)} rækker, 2 filer.")
 
 
