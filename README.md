@@ -27,6 +27,11 @@ Queue-driven; the mode is set by `mode` in the input:
   mapping the known ones to their `doc_id`.
 - **`delete_doc`** — deletes a document from GO (by `go_doc_id`) after it was
   deleted/removed in KontAKT.
+- **`generate_aktliste`** — (re)generates ONE GO/Nova case's aktliste (PDF +
+  Excel via `oomtm.reports`), uploads both to that case's SharePoint subfolder
+  (stable filenames → overwrite), and journalises them onto the GO case. Fired on
+  every doc-list change (coalesced by reference) and at share time. Idempotent, no
+  callback. The `Filnavn` column uses the editable `display_name` (rename-to-redact).
 
 Documents are journalised into a sub-folder per GO/Nova case under the GO case's
 `Dokumenter` library, mirroring the SharePoint layout (`{source_case_id}`; files
@@ -37,19 +42,20 @@ itself; the large-file chunked path makes a placeholder folder first (oomtm.go).
 
 | Field | Modes | Meaning |
 |-------|-------|---------|
-| `mode` | all | `create_case` / `update_metadata` / `journalize_email` / `journalize_ref` / `journalize_folder` / `delete_doc` |
+| `mode` | all | `create_case` / `update_metadata` / `journalize_email` / `journalize_ref` / `journalize_folder` / `delete_doc` / `generate_aktliste` |
 | `kontakt_case_id` | all | KontAKT case id (callback target) |
 | `go_case_no` | most | the GO `AKT-…` case number |
 | `title` | create/update | Emne → `ows_Title` |
 | `modtaget` | create/update | `YYYY-MM-DD HH:MM:SS` → `ows_Modtaget` |
 | `caseworker_email` | create/update | the caseworker to set as CaseOwner |
 | `email_id` | journalize_email | KontAKT `case_emails` row to journalise |
-| `source_case_id` | journalize_ref | the GO/Nova case whose files to journalise |
-| `case_title` | journalize_folder | builds the SharePoint folder path |
+| `source_case_id` | journalize_ref / generate_aktliste | the GO/Nova case to act on |
+| `case_title` | journalize_folder / generate_aktliste | builds the SharePoint folder path |
 | `go_doc_id` | delete_doc | the GO DocId to delete |
 
-Large data (e-mail bodies, the delivered-files list) is **fetched from KontAKT**
-(`GET /api/v1/cases/{id}/emails/{email_id}`, `…/delivery-files[?source_case_id=]`).
+Large data (e-mail bodies, delivered-files list, aktliste rows) is **fetched from
+KontAKT** (`…/emails/{email_id}`, `…/delivery-files[?source_case_id=]`,
+`…/aktliste?source_case_id=`).
 
 ## Output / callbacks
 

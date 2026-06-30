@@ -17,7 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "OpenOrchestrator == 3.*",
-    "oomtm[pdf] @ git+https://github.com/mtm-aarhus/oomtm.git@main",
+    "oomtm[pdf,reports] @ git+https://github.com/mtm-aarhus/oomtm.git@main",
     "requests >= 2.31",
     "Pillow == 10.*",
 ]

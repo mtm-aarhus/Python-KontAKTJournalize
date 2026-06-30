@@ -35,6 +35,7 @@ OO config (same as the other KontAKT GO robots):
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 from OpenOrchestrator.database.queues import QueueElement
 from urllib.parse import quote, unquote, urlparse
+from datetime import datetime
 import json
 import os
 import posixpath
@@ -45,6 +46,7 @@ import requests
 from robot_framework import reset
 from oomtm import go as oomtm_go
 from oomtm import pdf as oomtm_pdf
+from oomtm import reports as oomtm_reports
 from oomtm import sharepoint as sp
 
 # The AKT cases live under the /aktindsigt web (the caseworker's proven create
@@ -92,6 +94,8 @@ def process(
         _journalize_folder(orchestrator_connection, client, case_id, payload)
     elif mode == "delete_doc":
         _delete_doc(orchestrator_connection, client, case_id, payload)
+    elif mode == "generate_aktliste":
+        _generate_aktliste(orchestrator_connection, client, case_id, payload)
     else:
         raise RuntimeError(f"Unknown KontAKTJournalize mode: {mode!r}")
 
@@ -317,6 +321,59 @@ def _delete_doc(oc, client, case_id, payload):
         return
     oomtm_go.delete_document(client.go_session, base_url=client.go_url, doc_id=go_doc_id)
     oc.log_info(f"GO delete_doc done: {go_doc_id}")
+
+
+def _generate_aktliste(oc, client, case_id, payload):
+    """(Re)generate ONE GO/Nova case's aktliste (PDF + Excel), upload it to that
+    case's SharePoint subfolder, and journalise both onto the GO case. Idempotent
+    — stable filenames overwrite the previous aktliste, so re-running on every doc
+    change just refreshes it. No callback (fire-and-forget derived artifact)."""
+    go_case_no = str(payload.get("go_case_no") or "").strip()
+    source_case_id = str(payload.get("source_case_id") or "").strip()
+    case_title = str(payload.get("case_title") or "")
+    oc.log_info(f"Aktliste case={case_id} sag={source_case_id} -> {go_case_no}")
+    if not source_case_id:
+        return
+    data = _kontakt_get(client, f"/api/v1/cases/{case_id}/aktliste?source_case_id={quote(source_case_id)}")
+    rows = data.get("rows") or []
+    sagsnummer = data.get("sagsnummer") or source_case_id
+    if not rows:
+        oc.log_info("Aktliste: ingen dokumenter — springer over.")
+        return
+
+    dato = datetime.now().strftime("%d-%m-%Y")
+    logo = os.path.join(os.path.dirname(__file__), "aak.jpg")
+    logo = logo if os.path.exists(logo) else None
+    xlsx_bytes = oomtm_reports.aktliste_xlsx(rows)
+    pdf_bytes = oomtm_reports.aktliste_pdf(rows, sagsnummer=sagsnummer, dato_string=dato, logo_path=logo)
+
+    # Stable filenames so each regeneration overwrites the previous aktliste.
+    files = [(f"Aktliste - {sagsnummer}.xlsx", xlsx_bytes),
+             (f"Aktliste - {sagsnummer}.pdf", pdf_bytes)]
+
+    # SharePoint target: the GO/Nova case's delivery subfolder (the same path the
+    # share + to-PDF robots use). It exists already — KontAKT only enqueues this
+    # once files have been delivered there.
+    overmappe = sp.sanitize_segment(f"{case_id} - {case_title}")[:120].strip() or str(case_id)
+    undermappe = sp.sanitize_segment(source_case_id)[:80].strip() or "ukendt-sag"
+    sp_folder = sp.build_server_relative_path(client.sp_site_url, LIBRARY, overmappe, undermappe)
+
+    created_folders: set = set()
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, blob in files:
+            local = os.path.join(tmp, _safe_name(name))
+            with open(local, "wb") as fh:
+                fh.write(blob)
+            sp.upload_file(client.sp_ctx, folder_path=sp_folder, local_file=local, overwrite=True)
+            meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Internt")
+            go_doc_id = oomtm_go.upload_document(
+                client.go_session, base_url=client.go_url, case_id=go_case_no,
+                file_bytes=blob, file_name=name, metadata_xml=meta,
+                folder_path=undermappe, created_folders=created_folders,
+            )
+            if go_doc_id:
+                oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=[go_doc_id])
+    oc.log_info(f"Aktliste opdateret for {sagsnummer}: {len(rows)} rækker, 2 filer.")
 
 
 # ----- metadata XML builders -------------------------------------------------
