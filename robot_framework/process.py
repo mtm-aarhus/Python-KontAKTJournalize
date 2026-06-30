@@ -123,7 +123,8 @@ def _create_case(oc, client, case_id, payload):
         return
 
     owner_note = _try_set_owner(oc, client, go_case_no, caseworker_email, relative_url)
-    _callback(oc, client, path, {"ok": True, "go_case_no": go_case_no, "note": owner_note})
+    _callback(oc, client, path, {"ok": True, "go_case_no": go_case_no,
+                                 "case_relative_url": relative_url, "note": owner_note})
     oc.log_info(f"GO create_case done: {go_case_no}")
 
 
