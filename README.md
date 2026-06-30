@@ -19,32 +19,46 @@ Queue-driven; the mode is set by `mode` in the input:
   and CaseOwner when they change in KontAKT.
 - **`journalize_email`** — fetches a sent e-mail from KontAKT, renders it to PDF
   (LibreOffice), then adds + journalises it on the GO case.
-- **`finalize`** — downloads every delivered SharePoint file, uploads each to the
-  GO case, journalises them (MarkMultipleAsCaseRecord) and **closes** the GO
-  case. Calls back so KontAKT closes the case too.
+- **`journalize_ref`** — fired when ONE GO/Nova case is shared: downloads its
+  delivered files (`?source_case_id=…`) from SharePoint, adds + journalises them
+  on the GO case, and reports `doc_id → go_doc_id` back.
+- **`journalize_folder`** — fired when the WHOLE case is shared: journalises every
+  file in the case's SharePoint folder (incl. files added manually in SharePoint),
+  mapping the known ones to their `doc_id`.
+- **`delete_doc`** — deletes a document from GO (by `go_doc_id`) after it was
+  deleted/removed in KontAKT.
+
+Documents are journalised into a sub-folder per GO/Nova case under the GO case's
+`Dokumenter` library, mirroring the SharePoint layout (`{source_case_id}`; files
+lying loose in the case folder go to the root). `AddToCase` creates the folder
+itself; the large-file chunked path makes a placeholder folder first (oomtm.go).
 
 ## Input
 
 | Field | Modes | Meaning |
 |-------|-------|---------|
-| `mode` | all | `create_case` / `update_metadata` / `journalize_email` / `finalize` |
+| `mode` | all | `create_case` / `update_metadata` / `journalize_email` / `journalize_ref` / `journalize_folder` / `delete_doc` |
 | `kontakt_case_id` | all | KontAKT case id (callback target) |
-| `go_case_no` | update/email/finalize | the GO `AKT-…` case number |
+| `go_case_no` | most | the GO `AKT-…` case number |
 | `title` | create/update | Emne → `ows_Title` |
 | `modtaget` | create/update | `YYYY-MM-DD HH:MM:SS` → `ows_Modtaget` |
 | `caseworker_email` | create/update | the caseworker to set as CaseOwner |
 | `email_id` | journalize_email | KontAKT `case_emails` row to journalise |
+| `source_case_id` | journalize_ref | the GO/Nova case whose files to journalise |
+| `case_title` | journalize_folder | builds the SharePoint folder path |
+| `go_doc_id` | delete_doc | the GO DocId to delete |
 
 Large data (e-mail bodies, the delivered-files list) is **fetched from KontAKT**
-(`GET /api/v1/cases/{id}/emails/{email_id}`, `…/delivery-files`) rather than put
-on the 2000-char queue payload.
+(`GET /api/v1/cases/{id}/emails/{email_id}`, `…/delivery-files[?source_case_id=]`).
 
 ## Output / callbacks
 
 - create → `POST /api/v1/cases/{id}/go-journal/created` `{ok, go_case_no, note}`
 - update → `POST /api/v1/cases/{id}/go-journal/updated` `{ok, note}`
 - email → `POST /api/v1/cases/{id}/emails/{email_id}/journalized` `{ok, doc_id}`
-- finalize → `POST /api/v1/cases/{id}/go-journal/finalized` `{ok, doc_count}`
+- journalize_ref / journalize_folder → `POST /api/v1/cases/{id}/go-journal/documents-journalized`
+  `{ok, mappings:[{doc_id, go_doc_id}], doc_count}`
+- delete_doc → no callback (best-effort; the KontAKT row is already gone)
 
 (or `{ok: false, note}` on failure)
 
