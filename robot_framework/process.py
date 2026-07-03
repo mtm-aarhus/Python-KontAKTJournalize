@@ -195,15 +195,33 @@ def _journalize_email(oc, client, case_id, payload):
 # ----- journalise documents (at share time) ----------------------------------
 
 
-def _upload_delivery_file(client, go_case_no, server_rel, name, folder_path="",
+def _fetch_content(client, case_id, doc_id, local_path) -> bool:
+    """Stream a document's stored bytes from KontAKT's file store to ``local_path``.
+    Returns False if the file isn't in the store (404)."""
+    r = requests.get(
+        f"{client.kontakt_base}/api/v1/cases/{case_id}/documents/{doc_id}/content",
+        headers={"X-API-Key": client.kontakt_key}, timeout=300, stream=True,
+    )
+    if r.status_code == 404:
+        return False
+    r.raise_for_status()
+    with open(local_path, "wb") as fh:
+        for chunk in r.iter_content(1 << 20):
+            if chunk:
+                fh.write(chunk)
+    return True
+
+
+def _upload_delivery_file(client, case_id, go_case_no, doc_id, name, folder_path="",
                           created_folders=None):
-    """Download one SharePoint file (by server-relative path) and upload it to
-    the GO case under ``folder_path`` (relative to the case's Dokumenter library).
-    Returns the GO DocId (or None)."""
-    name = (name or os.path.basename(server_rel) or "dokument")
+    """Fetch one delivered document's bytes from KontAKT's file store and upload it
+    to the GO case under ``folder_path`` (a sub-folder in the GO Dokumenter
+    library). Returns the GO DocId, or None if the file isn't in the store."""
+    name = (name or f"dokument-{doc_id}")
     with tempfile.TemporaryDirectory() as tmp:
         local = os.path.join(tmp, _safe_name(name))
-        sp.download_file(client.sp_ctx, file_path=server_rel, local_path=local)
+        if not _fetch_content(client, case_id, doc_id, local):
+            return None
         with open(local, "rb") as fh:
             file_bytes = fh.read()
     meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Udgående")
@@ -212,20 +230,6 @@ def _upload_delivery_file(client, go_case_no, server_rel, name, folder_path="",
         file_bytes=file_bytes, file_name=name, metadata_xml=meta, folder_path=folder_path,
         created_folders=created_folders,
     )
-
-
-def _rel_folder(server_rel: str, overmappe: str) -> str:
-    """GO folder path for a delivered file = its SharePoint folder relative to the
-    case overmappe, so GO mirrors SharePoint (one sub-folder per GO/Nova case;
-    '' for files lying loose in the overmappe). Both paths are decoded
-    server-relative URLs."""
-    file_dir = posixpath.dirname(server_rel)
-    over = overmappe.rstrip("/")
-    if file_dir == over:
-        return ""
-    if file_dir.startswith(over + "/"):
-        return file_dir[len(over) + 1:]
-    return ""  # file isn't under the overmappe (shouldn't happen) → case root
 
 
 def _journalize_ref(oc, client, case_id, payload):
@@ -240,22 +244,17 @@ def _journalize_ref(oc, client, case_id, payload):
         return
     try:
         data = _kontakt_get(client, f"/api/v1/cases/{case_id}/delivery-files?source_case_id={quote(source_case_id)}")
-        # One sub-folder per GO/Nova case, named exactly like the SharePoint
-        # undermappe (so GO mirrors SharePoint and the aktliste lands beside it).
-        folder = sp.sanitize_segment(source_case_id)[:80].strip() or "ukendt-sag"
+        folder = sp.sanitize_segment(source_case_id)[:80].strip() or "ukendt-sag"  # GO Dokumenter sub-folder
         created_folders: set = set()
         mappings, go_doc_ids = [], []
         for f in data.get("files") or []:
-            url = (f.get("sharepoint_url") or "").strip()
-            if not url:
+            if f.get("id") is None:
                 continue
-            server_rel = unquote(urlparse(url).path)
-            go_doc_id = _upload_delivery_file(client, go_case_no, server_rel,
+            go_doc_id = _upload_delivery_file(client, case_id, go_case_no, f["id"],
                                               f.get("file_name"), folder, created_folders)
             if go_doc_id:
                 go_doc_ids.append(go_doc_id)
-                if f.get("id") is not None:
-                    mappings.append({"doc_id": f["id"], "go_doc_id": go_doc_id})
+                mappings.append({"doc_id": f["id"], "go_doc_id": go_doc_id})
         if go_doc_ids:
             oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=go_doc_ids)
     except Exception as exc:  # pylint: disable=broad-except
@@ -267,41 +266,28 @@ def _journalize_ref(oc, client, case_id, payload):
 
 
 def _journalize_folder(oc, client, case_id, payload):
-    """Journalise EVERY file in the case's SharePoint folder onto the GO case
-    (fired when the whole case is shared) — catches files a caseworker added in
-    SharePoint by hand. Maps the ones KontAKT knows about to their doc_id."""
+    """Journalise ALL of the case's delivered documents onto the GO case (fired
+    when the whole case is shared). Reads the doc list from KontAKT and mirrors
+    each GO/Nova case into its own GO Dokumenter sub-folder."""
     path = f"/api/v1/cases/{case_id}/go-journal/documents-journalized"
     go_case_no = str(payload.get("go_case_no") or "").strip()
-    case_title = str(payload.get("case_title") or "")
     oc.log_info(f"GO journalize_folder case={case_id} -> {go_case_no}")
     if not go_case_no:
         _callback(oc, client, path, {"ok": False, "note": "Sagen er endnu ikke oprettet i GO."})
         return
     try:
-        overmappe = sp.build_server_relative_path(
-            client.sp_site_url, LIBRARY,
-            sp.sanitize_segment(f"{case_id} - {case_title}")[:120].strip() or str(case_id))
-        sp_files = sp.list_files_recursive(client.sp_ctx, overmappe)
-        # Map KontAKT's known files (server-relative URL → doc_id) for go_doc_id.
         km = _kontakt_get(client, f"/api/v1/cases/{case_id}/delivery-files")
-        url_to_doc = {
-            unquote(urlparse(f["sharepoint_url"]).path): f["id"]
-            for f in (km.get("files") or [])
-            if f.get("sharepoint_url") and f.get("id") is not None
-        }
         created_folders: set = set()
         mappings, go_doc_ids = [], []
-        for spf in sp_files:
-            full, name = spf["path"], spf["name"]
-            # Mirror the SharePoint sub-folder per GO/Nova case ('' for loose files).
-            folder = _rel_folder(full, overmappe)
-            go_doc_id = _upload_delivery_file(client, go_case_no, full, name,
-                                              folder, created_folders)
+        for f in km.get("files") or []:
+            if f.get("id") is None:
+                continue
+            folder = sp.sanitize_segment(f.get("source_case_id") or "")[:80].strip() or "ukendt-sag"
+            go_doc_id = _upload_delivery_file(client, case_id, go_case_no, f["id"],
+                                              f.get("file_name"), folder, created_folders)
             if go_doc_id:
                 go_doc_ids.append(go_doc_id)
-                doc_id = url_to_doc.get(full)
-                if doc_id is not None:
-                    mappings.append({"doc_id": doc_id, "go_doc_id": go_doc_id})
+                mappings.append({"doc_id": f["id"], "go_doc_id": go_doc_id})
         if go_doc_ids:
             oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=go_doc_ids)
     except Exception as exc:  # pylint: disable=broad-except
@@ -350,32 +336,23 @@ def _generate_aktliste(oc, client, case_id, payload):
         xlsx_bytes = oomtm_reports.aktliste_xlsx(rows)
         pdf_bytes = oomtm_reports.aktliste_pdf(rows, sagsnummer=sagsnummer, dato_string=dato, logo_path=logo)
 
-        # Stable filenames so each regeneration overwrites the previous aktliste.
+        # Stable filenames so each regeneration overwrites the previous on GO.
         files = [(f"Aktliste - {sagsnummer}.xlsx", xlsx_bytes),
                  (f"Aktliste - {sagsnummer}.pdf", pdf_bytes)]
 
-        # SharePoint target: the GO/Nova case's delivery subfolder (the same path
-        # the share + to-PDF robots use). It exists already — KontAKT only enqueues
-        # this once files have been delivered there.
-        overmappe = sp.sanitize_segment(f"{case_id} - {case_title}")[:120].strip() or str(case_id)
+        # Journalise the aktliste onto the GO case, in the GO/Nova case's sub-folder.
+        # (Citizen delivery of the aktliste is handled by the delivery layer, not here.)
         undermappe = sp.sanitize_segment(source_case_id)[:80].strip() or "ukendt-sag"
-        sp_folder = sp.build_server_relative_path(client.sp_site_url, LIBRARY, overmappe, undermappe)
-
         created_folders: set = set()
-        with tempfile.TemporaryDirectory() as tmp:
-            for name, blob in files:
-                local = os.path.join(tmp, _safe_name(name))
-                with open(local, "wb") as fh:
-                    fh.write(blob)
-                sp.upload_file(client.sp_ctx, folder_path=sp_folder, local_file=local, overwrite=True)
-                meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Internt")
-                go_doc_id = oomtm_go.upload_document(
-                    client.go_session, base_url=client.go_url, case_id=go_case_no,
-                    file_bytes=blob, file_name=name, metadata_xml=meta,
-                    folder_path=undermappe, created_folders=created_folders,
-                )
-                if go_doc_id:
-                    oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=[go_doc_id])
+        for name, blob in files:
+            meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Internt")
+            go_doc_id = oomtm_go.upload_document(
+                client.go_session, base_url=client.go_url, case_id=go_case_no,
+                file_bytes=blob, file_name=name, metadata_xml=meta,
+                folder_path=undermappe, created_folders=created_folders,
+            )
+            if go_doc_id:
+                oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=[go_doc_id])
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"Aktliste failed: {exc!r}")
         _callback(oc, client, path, {"ok": False, "source_case_id": source_case_id, "note": str(exc)[:400]})
