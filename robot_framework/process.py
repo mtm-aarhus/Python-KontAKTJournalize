@@ -21,15 +21,12 @@ journalises the correspondence + the final delivery onto it. Mode is set by
 * ``delete_doc``      — delete a document from GO (by go_doc_id) after it was
                         deleted in KontAKT.
 
-The GO + SharePoint connections and the cached KontAKT credentials live on the
-``Client`` opened in ``reset.open_all`` and are reused across queue elements.
+The GO connection and the cached KontAKT credentials live on the ``Client``
+opened in ``reset.open_all`` and are reused across queue elements.
 
 OO config (same as the other KontAKT GO robots):
     Constant   GOApiURL          — GO base URL (e.g. https://ad.go.aarhuskommune.dk)
     Credential GOAktApiUser      — GO NTLM username + password
-    Constant   KontAKTSharePoint — SharePoint site URL (delivery library)
-    Credential SharePointCert    — username = thumbprint, password = cert path
-    Credential SharePointAPI     — username = tenant,     password = client id
     Credential KontAKTAPI        — username = base URL,    password = X-API-Key
 """
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
