@@ -12,12 +12,12 @@ journalises the correspondence + the final delivery onto it. Mode is set by
                         KontAKT.
 * ``journalize_email``— fetch a sent e-mail from KontAKT, render it to PDF and
                         add + journalise it on the GO case.
-* ``journalize_ref``  — when ONE GO/Nova case is shared: download its delivered
-                        files from SharePoint, add + journalise them on the GO
-                        case, and report doc_id → go_doc_id back to KontAKT.
-* ``journalize_folder``— when the WHOLE case is shared: journalise every file in
-                        the case's SharePoint folder (incl. files added manually
-                        in SharePoint), mapping the known ones to their doc_id.
+* ``journalize_ref``  — when ONE GO/Nova case is shared: fetch its delivered
+                        files from KontAKT's file store (by doc-id), add +
+                        journalise them on the GO case, and report doc_id →
+                        go_doc_id back to KontAKT.
+* ``journalize_folder``— when the WHOLE case is shared: journalise every
+                        delivered file for the case, mapping each to its doc_id.
 * ``delete_doc``      — delete a document from GO (by go_doc_id) after it was
                         deleted in KontAKT.
 
@@ -44,7 +44,7 @@ from robot_framework import reset
 from oomtm import go as oomtm_go
 from oomtm import pdf as oomtm_pdf
 from oomtm import reports as oomtm_reports
-from oomtm import sharepoint as sp
+from oomtm import sharepoint as sp  # sanitize_segment helper only
 
 # The AKT cases live under the /aktindsigt web (the caseworker's proven create
 # endpoint is …/aktindsigt/_goapi/Cases). Metadata/upload/close route by CaseId,
@@ -60,8 +60,6 @@ FACET = "4;#A53 Aktindsigtsanmodning mv."
 FACET_TERM = "A53 Aktindsigtsanmodning mv.|db5714c1-9346-47e6-b7a7-2230bf997699"
 FACET_FIELD = "hd725939cd4d495483312d36ba720a4d"
 
-# SharePoint delivery library (same as the share / to-PDF / delete robots).
-LIBRARY = "Delte dokumenter"
 
 
 def process(
@@ -307,8 +305,8 @@ def _delete_doc(oc, client, case_id, payload):
 
 
 def _generate_aktliste(oc, client, case_id, payload):
-    """(Re)generate ONE GO/Nova case's aktliste (PDF + Excel), upload it to that
-    case's SharePoint subfolder, and journalise both onto the GO case. Idempotent
+    """(Re)generate ONE GO/Nova case's aktliste (PDF + Excel) and journalise both
+    onto the GO case. Idempotent
     — stable filenames overwrite the previous aktliste, so re-running on every doc
     change just refreshes it. No callback (fire-and-forget derived artifact)."""
     path = f"/api/v1/cases/{case_id}/aktliste/generated"

@@ -30,7 +30,7 @@ def main():
     for _ in range(config.MAX_RETRY_COUNT):
         try:
             # reset() cleans the slate and (re)opens the shared connections
-            # (GO/Nova/SharePoint, cached credentials), returning them as a
+            # (GO/Nova + KontAKT, cached credentials), returning them as a
             # client that's reused across every queue element instead of
             # reconnecting per document. Re-run on each outer retry.
             client = reset.reset(orchestrator_connection)

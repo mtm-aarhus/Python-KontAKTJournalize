@@ -19,24 +19,22 @@ Queue-driven; the mode is set by `mode` in the input:
   and CaseOwner when they change in KontAKT.
 - **`journalize_email`** — fetches a sent e-mail from KontAKT, renders it to PDF
   (LibreOffice), then adds + journalises it on the GO case.
-- **`journalize_ref`** — fired when ONE GO/Nova case is shared: downloads its
-  delivered files (`?source_case_id=…`) from SharePoint, adds + journalises them
-  on the GO case, and reports `doc_id → go_doc_id` back.
+- **`journalize_ref`** — fired when ONE GO/Nova case is shared: fetches its
+  delivered files from KontAKT's file store (by doc-id, via `…/content`), adds +
+  journalises them on the GO case, and reports `doc_id → go_doc_id` back.
 - **`journalize_folder`** — fired when the WHOLE case is shared: journalises every
-  file in the case's SharePoint folder (incl. files added manually in SharePoint),
-  mapping the known ones to their `doc_id`.
+  delivered file for the case, mapping each to its `doc_id`.
 - **`delete_doc`** — deletes a document from GO (by `go_doc_id`) after it was
   deleted/removed in KontAKT.
 - **`generate_aktliste`** — (re)generates ONE GO/Nova case's aktliste (PDF +
-  Excel via `oomtm.reports`), uploads both to that case's SharePoint subfolder
-  (stable filenames → overwrite), and journalises them onto the GO case. Fired on
+  Excel via `oomtm.reports`) and journalises both onto the GO case. Fired on
   every doc-list change (coalesced by reference) and at share time. Idempotent, no
   callback. The `Filnavn` column uses the editable `display_name` (rename-to-redact).
 
-Documents are journalised into a sub-folder per GO/Nova case under the GO case's
-`Dokumenter` library, mirroring the SharePoint layout (`{source_case_id}`; files
-lying loose in the case folder go to the root). `AddToCase` creates the folder
-itself; the large-file chunked path makes a placeholder folder first (oomtm.go).
+Documents are journalised into a sub-folder per GO/Nova case (named by
+`{source_case_id}`) under the GO case's `Dokumenter` library; files with no
+source case go to the root. `AddToCase` creates the folder itself; the large-file
+chunked path makes a placeholder folder first (oomtm.go).
 
 ## Input
 
@@ -50,12 +48,11 @@ itself; the large-file chunked path makes a placeholder folder first (oomtm.go).
 | `caseworker_email` | create/update | the caseworker to set as CaseOwner |
 | `email_id` | journalize_email | KontAKT `case_emails` row to journalise |
 | `source_case_id` | journalize_ref / generate_aktliste | the GO/Nova case to act on |
-| `case_title` | journalize_folder / generate_aktliste | builds the SharePoint folder path |
 | `go_doc_id` | delete_doc | the GO DocId to delete |
 
 Large data (e-mail bodies, delivered-files list, aktliste rows) is **fetched from
 KontAKT** (`…/emails/{email_id}`, `…/delivery-files[?source_case_id=]`,
-`…/aktliste?source_case_id=`).
+`…/aktliste?source_case_id=`); file bytes come from `…/documents/{doc_id}/content`.
 
 ## Output / callbacks
 
@@ -72,16 +69,13 @@ KontAKT** (`…/emails/{email_id}`, `…/delivery-files[?source_case_id=]`,
 
 - Constant `GOApiURL` — GO base URL (e.g. `https://ad.go.aarhuskommune.dk`)
 - Credential `GOAktApiUser` — GO NTLM username + password
-- Constant `KontAKTSharePoint` — SharePoint site URL (delivery library)
-- Credential `SharePointCert` — username = thumbprint, password = certificate path
-- Credential `SharePointAPI` — username = tenant, password = client id
 - Credential `KontAKTAPI` — username = base URL, password = API key
 
 ## Dependencies
 
-The shared [`oomtm`](https://github.com/mtm-aarhus/oomtm) library (`go`,
-`sharepoint`, `pdf`). E-mail/HTML → PDF uses LibreOffice headless, auto-installed
-on first use by `oomtm.pdf.ensure_libreoffice`.
+The shared [`oomtm`](https://github.com/mtm-aarhus/oomtm) library (`go`, `pdf`).
+E-mail/HTML → PDF uses LibreOffice headless, auto-installed on first use by
+`oomtm.pdf.ensure_libreoffice`.
 
 ## Caveats
 
@@ -90,6 +84,6 @@ on first use by `oomtm.pdf.ensure_libreoffice`.
   from the create response's `CaseRelativeUrl` (which equals `ows_CaseUrl`), so
   there's no tenant-specific guess. It's best-effort and never fails the job — if
   it can't be set, the case still exists and the owner can be set in GO.
-- Large files (>10 MB) upload to GO via a chunked SharePoint upload
+- Large files (>10 MB) upload to GO via a chunked upload
   (startUpload/continueUpload/finishUpload to the case's `Dokumenter` library,
   then locate the DocId + set metadata) instead of the AddToCase byte-array.
