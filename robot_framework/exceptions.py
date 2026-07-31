@@ -13,6 +13,17 @@ class BusinessError(Exception):
     """An empty exception used to identify errors caused by breaking business rules"""
 
 
+class CaseDeleted(Exception):
+    """What this queue element was about no longer exists in KontAKT.
+
+    KontAKT answers HTTP 410 with ``{"case_deleted": true}`` (or
+    ``{"document_deleted": true}``) when the caseworker deleted the case, mappe
+    or document while the element waited in the queue. There is nothing to do
+    and nothing to fix, so the queue framework marks the element DONE instead of
+    FAILED: no retry, no error screenshot.
+    """
+
+
 def handle_error(message: str, error: Exception, queue_element: QueueElement | None, orchestrator_connection: OrchestratorConnection) -> None:
     """Handles an error caught during the process.
     Logs an error to OpenOrchestrator.

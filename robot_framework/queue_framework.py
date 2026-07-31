@@ -10,7 +10,7 @@ from OpenOrchestrator.database.queues import QueueStatus
 
 from robot_framework import initialize
 from robot_framework import reset
-from robot_framework.exceptions import handle_error, BusinessError, log_exception
+from robot_framework.exceptions import handle_error, BusinessError, CaseDeleted, log_exception
 from robot_framework import process
 from robot_framework import config
 
@@ -51,6 +51,12 @@ def main():
                     for attempt in range(1, config.QUEUE_ATTEMPTS + 1):
                         try:
                             process.process(orchestrator_connection, queue_element, client)
+                            break
+                        except CaseDeleted as exc:
+                            # Deleted in KontAKT while this element waited. DONE,
+                            # not FAILED — retrying can't bring it back, and this
+                            # is not something an operator needs to look at.
+                            orchestrator_connection.log_info(f"Skipping queue element: {exc}")
                             break
                         except BusinessError:
                             raise

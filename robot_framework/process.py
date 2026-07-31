@@ -41,6 +41,7 @@ import tempfile
 import requests
 
 from robot_framework import reset
+from robot_framework.exceptions import CaseDeleted
 from oomtm import go as oomtm_go
 from oomtm import pdf as oomtm_pdf
 from oomtm import reports as oomtm_reports
@@ -60,6 +61,27 @@ FACET = "4;#A53 Aktindsigtsanmodning mv."
 FACET_TERM = "A53 Aktindsigtsanmodning mv.|db5714c1-9346-47e6-b7a7-2230bf997699"
 FACET_FIELD = "hd725939cd4d495483312d36ba720a4d"
 
+
+
+# ----- Deleted in KontAKT ----------------------------------------------------
+
+
+def _check_gone(resp) -> None:
+    """Stop cleanly if what this queue element is about was deleted in KontAKT.
+
+    KontAKT answers HTTP 410 with ``{"deleted": "case"|"reference"|"document"}``
+    when the caseworker deleted the KontAKT case, the sag/mappe or the document
+    while this element waited in the queue. Not an error and not retryable, so
+    the queue framework marks the element done and takes the next one.
+    """
+    if resp is None or resp.status_code != 410:
+        return
+    try:
+        body = resp.json() or {}
+    except ValueError:
+        body = {}
+    if body.get("deleted"):
+        raise CaseDeleted(body.get("note") or f"{body['deleted']} deleted in KontAKT")
 
 
 def process(
@@ -197,6 +219,7 @@ def _fetch_content(client, case_id, doc_id, local_path) -> bool:
         f"{client.kontakt_base}/api/v1/cases/{case_id}/documents/{doc_id}/content",
         headers={"X-API-Key": client.kontakt_key}, timeout=300, stream=True,
     )
+    _check_gone(r)
     if r.status_code == 404:
         return False
     r.raise_for_status()
@@ -483,16 +506,21 @@ def _kontakt_get(client, path: str) -> dict:
         headers={"X-API-Key": client.kontakt_key, "Accept": "application/json"},
         timeout=60,
     )
+    _check_gone(r)
     r.raise_for_status()
     return r.json()
 
 
 def _callback(oc, client, path: str, body: dict) -> None:
     try:
-        requests.post(
+        resp = requests.post(
             f"{client.kontakt_base}{path}",
             headers={"X-API-Key": client.kontakt_key, "Content-Type": "application/json"},
             json=body, timeout=30,
         )
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"Callback to KontAKT failed: {exc!r}")
+        return
+    # Outside the except: a network blip stays harmless, but "deleted in KontAKT"
+    # must reach the framework instead of being swallowed as a broad Exception.
+    _check_gone(resp)
