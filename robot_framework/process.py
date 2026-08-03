@@ -348,7 +348,10 @@ def _generate_aktliste(oc, client, case_id, payload):
             oc.log_info("Aktliste: ingen dokumenter — springer over.")
             return
 
-        dato = datetime.now().strftime("%d-%m-%Y")
+        # KontAKT decides the date: it is when the document list was fetched, so
+        # the journalised copy says the same thing as the applicant's copy. Only
+        # fall back to today if an older KontAKT didn't send one.
+        dato = (data.get("dato") or "").strip() or datetime.now().strftime("%d-%m-%Y")
         logo = os.path.join(os.path.dirname(__file__), "aak.jpg")
         logo = logo if os.path.exists(logo) else None
         xlsx_bytes = oomtm_reports.aktliste_xlsx(rows)
