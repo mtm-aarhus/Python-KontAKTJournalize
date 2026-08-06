@@ -31,11 +31,9 @@ OO config (same as the other KontAKT GO robots):
 """
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 from OpenOrchestrator.database.queues import QueueElement
-from urllib.parse import quote, unquote, urlparse
-from datetime import datetime
+from urllib.parse import quote
 import json
 import os
-import posixpath
 import tempfile
 
 import requests
@@ -44,7 +42,6 @@ from robot_framework import reset
 from robot_framework.exceptions import CaseDeleted
 from oomtm import go as oomtm_go
 from oomtm import pdf as oomtm_pdf
-from oomtm import reports as oomtm_reports
 from oomtm import sharepoint as sp  # sanitize_segment helper only
 
 # The AKT cases live under the /aktindsigt web (the caseworker's proven create
@@ -319,9 +316,16 @@ def _journalize_folder(oc, client, case_id, payload):
 def _delete_doc(oc, client, case_id, payload):
     """Delete a document from GO after it was deleted in KontAKT. Best-effort;
     no callback (the KontAKT row is already gone)."""
-    go_doc_id = str(payload.get("go_doc_id") or "").strip()
-    oc.log_info(f"GO delete_doc case={case_id} go_doc_id={go_doc_id}")
-    if not go_doc_id:
+    raw = str(payload.get("go_doc_id") or "").strip()
+    oc.log_info(f"GO delete_doc case={case_id} go_doc_id={raw}")
+    if not raw:
+        return
+    # GO documents DocId as an Int. KontAKT stores it in a text column, so it
+    # arrives as a string — send it as the number it is.
+    try:
+        go_doc_id = int(raw)
+    except ValueError:
+        oc.log_info(f"GO delete_doc: '{raw}' er ikke et DocId — springer over.")
         return
     oomtm_go.delete_document(client.go_session, base_url=client.go_url, doc_id=go_doc_id)
     oc.log_info(f"GO delete_doc done: {go_doc_id}")
@@ -348,14 +352,14 @@ def _generate_aktliste(oc, client, case_id, payload):
             oc.log_info("Aktliste: ingen dokumenter — springer over.")
             return
 
-        # KontAKT decides the date: it is when the document list was fetched, so
-        # the journalised copy says the same thing as the applicant's copy. Only
-        # fall back to today if an older KontAKT didn't send one.
-        dato = (data.get("dato") or "").strip() or datetime.now().strftime("%d-%m-%Y")
-        logo = os.path.join(os.path.dirname(__file__), "aak.jpg")
-        logo = logo if os.path.exists(logo) else None
-        xlsx_bytes = oomtm_reports.aktliste_xlsx(rows)
-        pdf_bytes = oomtm_reports.aktliste_pdf(rows, sagsnummer=sagsnummer, dato_string=dato, logo_path=logo)
+        # KontAKT renders the aktliste; this robot only files it. One renderer for
+        # the whole system means the applicant's copy, the caseworker's preview and
+        # the copy in GO cannot drift apart — layout, columns, logo and the
+        # "dokumentliste hentet" date all come from KontAKT.
+        xlsx_bytes = _kontakt_get_bytes(
+            client, f"/api/v1/cases/{case_id}/aktliste.xlsx?source_case_id={quote(source_case_id)}")
+        pdf_bytes = _kontakt_get_bytes(
+            client, f"/api/v1/cases/{case_id}/aktliste.pdf?source_case_id={quote(source_case_id)}")
 
         # Stable filenames so each regeneration overwrites the previous on GO.
         files = [(f"Aktliste - {sagsnummer}.xlsx", xlsx_bytes),
@@ -512,6 +516,20 @@ def _kontakt_get(client, path: str) -> dict:
     _check_gone(r)
     r.raise_for_status()
     return r.json()
+
+
+def _kontakt_get_bytes(client, path: str) -> bytes:
+    """Download a file KontAKT renders (the aktliste PDF/Excel)."""
+    r = requests.get(
+        f"{client.kontakt_base}{path}",
+        headers={"X-API-Key": client.kontakt_key},
+        timeout=180,
+    )
+    _check_gone(r)
+    r.raise_for_status()
+    if not r.content:
+        raise RuntimeError(f"KontAKT returned an empty file for {path}")
+    return r.content
 
 
 def _callback(oc, client, path: str, body: dict) -> None:

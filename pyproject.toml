@@ -17,7 +17,9 @@ classifiers = [
 ]
 dependencies = [
     "OpenOrchestrator == 3.*",
-    "oomtm[pdf,reports] @ git+https://github.com/mtm-aarhus/oomtm.git@main",
+    # KontAKT renders the aktliste now (GET /api/v1/cases/<id>/aktliste.pdf),
+    # so the "reports" extra (openpyxl + reportlab) is no longer needed here.
+    "oomtm[pdf] @ git+https://github.com/mtm-aarhus/oomtm.git@main",
     "requests >= 2.31",
     "Pillow == 10.*",
 ]
