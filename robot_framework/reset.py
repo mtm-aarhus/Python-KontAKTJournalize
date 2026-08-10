@@ -27,6 +27,22 @@ class Client:
         kontakt = orchestrator_connection.get_credential("KontAKTAPI")
         self.kontakt_base = kontakt.username
         self.kontakt_key = kontakt.password
+        # Deleting a journalised document means un-marking it as a case record,
+        # which GOAktApiUser is not allowed to do ("Bruger har ikke rettigheder
+        # til at afmarkere dokumet"). So deletion — and ONLY deletion — runs as
+        # GOAdminUser. Opened on first use rather than up front: a run that never
+        # deletes anything never authenticates with the privileged account, and it
+        # cannot be reached by accident from the other operations.
+        self._oc = orchestrator_connection
+        self._go_admin_session = None
+
+    def go_delete_session(self):
+        """The privileged session, for document deletion in GO and nothing else."""
+        if self._go_admin_session is None:
+            cred = self._oc.get_credential("GOAdminUser")
+            self._oc.log_info("Opening GO admin connection (deletion only).")
+            self._go_admin_session = oomtm_go.session(cred.username, cred.password)
+        return self._go_admin_session
 
 
 def reset(orchestrator_connection: OrchestratorConnection) -> Client:

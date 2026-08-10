@@ -315,7 +315,12 @@ def _journalize_folder(oc, client, case_id, payload):
 
 def _delete_doc(oc, client, case_id, payload):
     """Delete a document from GO after it was deleted in KontAKT. Best-effort;
-    no callback (the KontAKT row is already gone)."""
+    no callback (the KontAKT row is already gone).
+
+    Runs as GOAdminUser, the only account allowed to un-mark a document as a case
+    record — which is what deleting a journalised document requires. Every other
+    GO operation in this robot stays on GOAktApiUser: see Client.go_delete_session.
+    """
     raw = str(payload.get("go_doc_id") or "").strip()
     oc.log_info(f"GO delete_doc case={case_id} go_doc_id={raw}")
     if not raw:
@@ -327,7 +332,8 @@ def _delete_doc(oc, client, case_id, payload):
     except ValueError:
         oc.log_info(f"GO delete_doc: '{raw}' er ikke et DocId — springer over.")
         return
-    oomtm_go.delete_document(client.go_session, base_url=client.go_url, doc_id=go_doc_id)
+    oomtm_go.delete_document(client.go_delete_session(), base_url=client.go_url,
+                             doc_id=go_doc_id)
     oc.log_info(f"GO delete_doc done: {go_doc_id}")
 
 
