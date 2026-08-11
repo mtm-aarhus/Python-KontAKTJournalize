@@ -233,18 +233,19 @@ def _upload_delivery_file(client, case_id, go_case_no, doc_id, name, folder_path
     to the GO case under ``folder_path`` (a sub-folder in the GO Dokumenter
     library). Returns the GO DocId, or None if the file isn't in the store."""
     name = (name or f"dokument-{doc_id}")
+    meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Udgående")
+    # The upload streams from the temp file rather than reading it into memory, so a
+    # 2 GB video costs one chunk of RSS instead of two copies of itself. That means
+    # the whole thing has to happen INSIDE the TemporaryDirectory, not after it.
     with tempfile.TemporaryDirectory() as tmp:
         local = os.path.join(tmp, _safe_name(name))
         if not _fetch_content(client, case_id, doc_id, local):
             return None
-        with open(local, "rb") as fh:
-            file_bytes = fh.read()
-    meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Udgående")
-    return oomtm_go.upload_document(
-        client.go_session, base_url=client.go_url, case_id=go_case_no,
-        file_bytes=file_bytes, file_name=name, metadata_xml=meta, folder_path=folder_path,
-        created_folders=created_folders,
-    )
+        return oomtm_go.upload_document(
+            client.go_session, base_url=client.go_url, case_id=go_case_no,
+            file_path=local, file_name=name, metadata_xml=meta, folder_path=folder_path,
+            created_folders=created_folders,
+        )
 
 
 def _journalize_ref(oc, client, case_id, payload):
