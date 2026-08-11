@@ -102,6 +102,8 @@ def process(
         _update_metadata(orchestrator_connection, client, case_id, payload)
     elif mode == "journalize_email":
         _journalize_email(orchestrator_connection, client, case_id, payload)
+    elif mode == "sync_go":
+        _sync_go(orchestrator_connection, client, case_id, payload)
     elif mode == "journalize_ref":
         _journalize_ref(orchestrator_connection, client, case_id, payload)
     elif mode == "journalize_folder":
@@ -228,12 +230,17 @@ def _fetch_content(client, case_id, doc_id, local_path) -> bool:
 
 
 def _upload_delivery_file(client, case_id, go_case_no, doc_id, name, folder_path="",
-                          created_folders=None):
+                          created_folders=None, title=None):
     """Fetch one delivered document's bytes from KontAKT's file store and upload it
     to the GO case under ``folder_path`` (a sub-folder in the GO Dokumenter
-    library). Returns the GO DocId, or None if the file isn't in the store."""
+    library). Returns the GO DocId, or None if the file isn't in the store.
+
+    ``name`` is the filename the applicant's copy carries, so the file in GO can
+    be matched to its row in the aktliste. ``title`` is the caseworker's own title
+    for the document; without one the filename stands in."""
     name = (name or f"dokument-{doc_id}")
-    meta = _doc_metadata_xml(title=os.path.splitext(name)[0], korrespondance="Udgående")
+    meta = _doc_metadata_xml(title=(title or os.path.splitext(name)[0]),
+                             korrespondance="Udgående")
     # The upload streams from the temp file rather than reading it into memory, so a
     # 2 GB video costs one chunk of RSS instead of two copies of itself. That means
     # the whole thing has to happen INSIDE the TemporaryDirectory, not after it.
@@ -248,9 +255,151 @@ def _upload_delivery_file(client, case_id, go_case_no, doc_id, name, folder_path
         )
 
 
+def _sync_go(oc, client, case_id, payload):
+    """Bring the GO case in step with what KontAKT actually delivers.
+
+    Fired the first time a delivery link is created, and after every change to a
+    sag that has already been delivered. KontAKT hands over a **plan** — what to
+    upload, replace, delete and leave alone, plus whether the aktliste needs
+    redoing — so this robot never has to work out the difference itself, and a
+    retry or a missed change can't leave GO permanently wrong: the next run
+    recomputes the plan from current data. A run with nothing to do is normal.
+
+    Per document failures are reported and then raised, so the element is retried:
+    the callback has already recorded what did succeed, so a retry only redoes
+    what is left.
+    """
+    path = f"/api/v1/cases/{case_id}/go-journal/documents-journalized"
+    src = str(payload.get("source_case_id") or "").strip()
+    query = f"?source_case_id={quote(src)}" if src else ""
+    try:
+        plan = _kontakt_get(client, f"/api/v1/cases/{case_id}/go-journal/plan{query}")
+    except Exception as exc:  # pylint: disable=broad-except
+        oc.log_info(f"GO sync: kunne ikke hente planen: {exc!r}")
+        _callback(oc, client, path, {"ok": False, "source_case_id": src or None,
+                                     "note": f"Kunne ikke hente planen: {exc}"[:400]})
+        raise
+    go_case_no = str(plan.get("go_case_no") or payload.get("go_case_no") or "").strip()
+    if not go_case_no:
+        _callback(oc, client, path, {"ok": False, "source_case_id": src or None,
+                                     "note": "Sagen er endnu ikke oprettet i GO."})
+        return
+
+    sager = plan.get("sager") or []
+    if not sager:
+        oc.log_info("GO sync: ingen sager at holde i takt.")
+        return
+
+    results, failed_total = [], 0
+    for sag in sager:
+        result = _sync_one_sag(oc, client, case_id, go_case_no, sag)
+        failed_total += len(result["failed"])
+        results.append(result)
+    _callback(oc, client, path, {"ok": True, "sager": results})
+    if failed_total:
+        raise RuntimeError(f"{failed_total} dokument(er) kunne ikke journaliseres i GO.")
+
+
+def _sync_one_sag(oc, client, case_id, go_case_no, sag) -> dict:
+    """Execute one sag's part of the plan. Never raises — every failure lands in
+    ``failed`` so the rest of the sag still gets done."""
+    src = str(sag.get("source_case_id") or "").strip()
+    folder = sp.sanitize_segment(src)[:80].strip() or "ukendt-sag"
+    created_folders: set = set()
+    out = {"source_case_id": src, "uploaded": [], "replaced": [],
+           "deleted": [], "kept": sag.get("keep") or [], "failed": []}
+    oc.log_info(
+        f"GO sync {src}: {len(sag.get('upload') or [])} ny, "
+        f"{len(sag.get('replace') or [])} erstat, {len(sag.get('delete') or [])} slet.")
+
+    # Gone from the delivery -> gone from GO. Deleting means un-marking the case
+    # record first, which only GOAdminUser may do (see Client.go_delete_session).
+    for item in (sag.get("delete") or []):
+        try:
+            _go_delete(client, item.get("go_doc_id"))
+            out["deleted"].append(item.get("doc_id"))
+        except Exception as exc:  # pylint: disable=broad-except
+            oc.log_info(f"GO sync: kunne ikke slette DocId {item.get('go_doc_id')}: {exc!r}")
+            out["failed"].append({"doc_id": item.get("doc_id"), "note": str(exc)[:300]})
+
+    # Changed since it was filed: remove the old copy, then file the new one. Not
+    # an overwrite — a document marked as a case record can't be overwritten by
+    # the ordinary account, and a half-overwritten file is worse than a replaced one.
+    for item in (sag.get("replace") or []):
+        try:
+            _go_delete(client, item.get("go_doc_id"))
+        except Exception as exc:  # pylint: disable=broad-except
+            oc.log_info(f"GO sync: kunne ikke fjerne den gamle kopi af "
+                        f"doc={item.get('doc_id')}: {exc!r}")
+            out["failed"].append({"doc_id": item.get("doc_id"), "note": str(exc)[:300]})
+            continue
+        _file_one(oc, client, case_id, go_case_no, item, folder, created_folders,
+                  out, "replaced")
+
+    for item in (sag.get("upload") or []):
+        _file_one(oc, client, case_id, go_case_no, item, folder, created_folders,
+                  out, "uploaded")
+
+    fresh = [m["go_doc_id"] for m in out["uploaded"] + out["replaced"] if m.get("go_doc_id")]
+    if fresh:
+        try:
+            oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=fresh)
+        except Exception as exc:  # pylint: disable=broad-except
+            oc.log_info(f"GO sync: kunne ikke markere som sagsakt: {exc!r}")
+
+    # The dokumentliste changed with the documents, so the copy in GO has to be
+    # the new one. The previous pair is removed first, for the same reason as above.
+    if sag.get("aktliste"):
+        try:
+            for old in (sag.get("aktliste_go_doc_ids") or []):
+                try:
+                    _go_delete(client, old)
+                except Exception as exc:  # pylint: disable=broad-except
+                    oc.log_info(f"GO sync: gammel aktliste {old} kunne ikke fjernes: {exc!r}")
+            new_ids = _file_aktliste(oc, client, case_id, go_case_no, src)
+            if new_ids:
+                out["aktliste_go_doc_ids"] = new_ids
+        except Exception as exc:  # pylint: disable=broad-except
+            oc.log_info(f"GO sync: aktlisten for {src} fejlede: {exc!r}")
+            out["failed"].append({"doc_id": None, "note": f"Aktliste: {exc}"[:300]})
+    oc.log_info(f"GO sync {src} færdig: {len(out['uploaded'])} lagt op, "
+                f"{len(out['replaced'])} erstattet, {len(out['deleted'])} slettet, "
+                f"{len(out['failed'])} fejlede.")
+    return out
+
+
+def _file_one(oc, client, case_id, go_case_no, item, folder, created_folders, out, key):
+    try:
+        go_doc_id = _upload_delivery_file(client, case_id, go_case_no, item["doc_id"],
+                                          item.get("file_name"), folder, created_folders,
+                                          title=item.get("title"))
+        if go_doc_id:
+            out[key].append({"doc_id": item["doc_id"], "go_doc_id": go_doc_id,
+                             "token": item.get("token")})
+        else:
+            # No file in KontAKT's store: not this robot's problem to fix, but it
+            # must not silently look like success either.
+            out["failed"].append({"doc_id": item["doc_id"],
+                                  "note": "Dokumentet har ingen fil i filstoret."})
+    except Exception as exc:  # pylint: disable=broad-except
+        oc.log_info(f"GO sync: doc={item.get('doc_id')} kunne ikke lægges op: {exc!r}")
+        out["failed"].append({"doc_id": item.get("doc_id"), "note": str(exc)[:300]})
+
+
+def _go_delete(client, go_doc_id) -> None:
+    """Delete one document from GO by DocId, as GOAdminUser."""
+    raw = str(go_doc_id or "").strip()
+    if not raw:
+        return
+    oomtm_go.delete_document(client.go_delete_session(), base_url=client.go_url,
+                             doc_id=int(raw))
+
+
 def _journalize_ref(oc, client, case_id, payload):
-    """Journalise one GO/Nova case's delivered documents onto the GO case (fired
-    when that case is shared). Reports doc_id → go_doc_id mappings back."""
+    """Journalise one GO/Nova case's delivered documents onto the GO case.
+
+    Superseded by ``sync_go``, which files the same documents and then keeps them
+    in step. Kept so a queue element created before the upgrade still runs."""
     path = f"/api/v1/cases/{case_id}/go-journal/documents-journalized"
     go_case_no = str(payload.get("go_case_no") or "").strip()
     source_case_id = str(payload.get("source_case_id") or "").strip()
@@ -339,17 +488,27 @@ def _delete_doc(oc, client, case_id, payload):
 
 
 def _generate_aktliste(oc, client, case_id, payload):
-    """(Re)generate ONE GO/Nova case's aktliste (PDF + Excel) and journalise both
-    onto the GO case. Idempotent
-    — stable filenames overwrite the previous aktliste, so re-running on every doc
-    change just refreshes it. No callback (fire-and-forget derived artifact)."""
-    path = f"/api/v1/cases/{case_id}/aktliste/generated"
+    """Legacy mode: (re)generate one sag's aktliste and file it onto the GO case.
+
+    ``sync_go`` now does this as part of keeping the sag in step (and removes the
+    previous copy first, which an overwrite can't do once the file is marked as a
+    case record). Kept so a queue element created before the upgrade still runs."""
     go_case_no = str(payload.get("go_case_no") or "").strip()
     source_case_id = str(payload.get("source_case_id") or "").strip()
-    case_title = str(payload.get("case_title") or "")
-    oc.log_info(f"Aktliste case={case_id} sag={source_case_id} -> {go_case_no}")
     if not source_case_id:
         return
+    _file_aktliste(oc, client, case_id, go_case_no, source_case_id)
+
+
+def _file_aktliste(oc, client, case_id, go_case_no, source_case_id) -> list[str]:
+    """Render the aktliste (PDF + Excel) in KontAKT and file both onto the GO case.
+
+    Returns the new DocIds, so the next regeneration can remove exactly these two
+    instead of relying on an overwrite. Tells KontAKT which content the filed copy
+    reflects, so the caseworker's "aktlisten er aktuel" reading stays true."""
+    path = f"/api/v1/cases/{case_id}/aktliste/generated"
+    oc.log_info(f"Aktliste case={case_id} sag={source_case_id} -> {go_case_no}")
+    new_ids: list[str] = []
     try:
         data = _kontakt_get(client, f"/api/v1/cases/{case_id}/aktliste?source_case_id={quote(source_case_id)}")
         rows = data.get("rows") or []
@@ -357,7 +516,7 @@ def _generate_aktliste(oc, client, case_id, payload):
         content_token = data.get("content_token")
         if not rows:
             oc.log_info("Aktliste: ingen dokumenter — springer over.")
-            return
+            return new_ids
 
         # KontAKT renders the aktliste; this robot only files it. One renderer for
         # the whole system means the applicant's copy, the caseworker's preview and
@@ -368,7 +527,8 @@ def _generate_aktliste(oc, client, case_id, payload):
         pdf_bytes = _kontakt_get_bytes(
             client, f"/api/v1/cases/{case_id}/aktliste.pdf?source_case_id={quote(source_case_id)}")
 
-        # Stable filenames so each regeneration overwrites the previous on GO.
+        # Stable filenames: the same two documents each time, so GO holds one
+        # aktliste per sag rather than a pile of dated ones.
         files = [(f"Aktliste - {sagsnummer}.xlsx", xlsx_bytes),
                  (f"Aktliste - {sagsnummer}.pdf", pdf_bytes)]
 
@@ -384,14 +544,18 @@ def _generate_aktliste(oc, client, case_id, payload):
                 folder_path=undermappe, created_folders=created_folders,
             )
             if go_doc_id:
+                new_ids.append(str(go_doc_id))
                 oomtm_go.mark_as_case_record(client.go_session, base_url=client.go_url, doc_ids=[go_doc_id])
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"Aktliste failed: {exc!r}")
         _callback(oc, client, path, {"ok": False, "source_case_id": source_case_id, "note": str(exc)[:400]})
         raise
     # Tell KontAKT which content the aktliste now reflects, so it counts as current.
-    _callback(oc, client, path, {"ok": True, "source_case_id": source_case_id, "content_token": content_token})
+    _callback(oc, client, path, {"ok": True, "source_case_id": source_case_id,
+                                 "content_token": content_token,
+                                 "go_doc_ids": new_ids})
     oc.log_info(f"Aktliste opdateret for {sagsnummer}: {len(rows)} rækker, 2 filer.")
+    return new_ids
 
 
 # ----- metadata XML builders -------------------------------------------------
