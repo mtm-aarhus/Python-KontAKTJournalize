@@ -1,48 +1,66 @@
 """This module handles resetting the state of the computer so the robot can work with a clean slate.
 
-For this robot the "state" is the GO connection and the cached OO credentials.
-``open_all`` opens them and returns a :class:`Client`; ``reset`` re-opens them,
-so the queue framework can reconnect on a retry instead of reconnecting for
-every single document.
+For this robot the "state" is the F2 connection and the cached KontAKT
+credentials. ``open_all`` opens them and returns a :class:`Client`; ``reset``
+re-opens them, so the queue framework can reconnect on a retry instead of
+reconnecting for every single document.
+
+Der er ikke laengere en privilegeret konto. GO havde GOAdminUser, fordi sletning
+af et journaliseret dokument kraevede at det foerst blev afmarkeret som sagsakt.
+I F2 findes det problem ikke - et dokument kan slet ikke slettes, uanset hvem man
+er (det HAR ingen slette-relation), saa der er ingenting for en privilegeret
+konto at lave. Se ``process._udgaa_dokument``.
 """
 
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 
-from oomtm import go as oomtm_go
+from oomtm import f2 as oomtm_f2
 
 
 class Client:
-    """Live GO connection + cached KontAKT credentials.
+    """Live F2 connection + cached KontAKT credentials.
 
-    Opened once per run by ``open_all`` and reused across every queue element,
-    so a 2000-document case doesn't re-authenticate to GO 2000 times.
+    Opened once per run by ``open_all`` and reused across every queue element:
+    F2-klienten holder sit bearer-token og sit service index, saa en sag med
+    2000 dokumenter logger ind én gang og ikke 2000 gange.
     """
 
     def __init__(self, orchestrator_connection: OrchestratorConnection):
-        go_cred = orchestrator_connection.get_credential("GOAktApiUser")
-        self.go_url = orchestrator_connection.get_constant("GOApiURL").value
-        self.go_user = go_cred.username
-        self.go_pass = go_cred.password
-        self.go_session = oomtm_go.session(go_cred.username, go_cred.password)
+        self._oc = orchestrator_connection
+        # Hele F2-opsaetningen er ét sted, og et skifte til produktion er én
+        # constant (F2Miljoe). Se oomtm.f2.Config.from_orchestrator.
+        self.f2 = oomtm_f2.F2(
+            oomtm_f2.Config.from_orchestrator(orchestrator_connection),
+            log=orchestrator_connection.log_info)
         kontakt = orchestrator_connection.get_credential("KontAKTAPI")
         self.kontakt_base = kontakt.username
         self.kontakt_key = kontakt.password
-        # Deleting a journalised document means un-marking it as a case record,
-        # which GOAktApiUser is not allowed to do ("Bruger har ikke rettigheder
-        # til at afmarkere dokumet"). So deletion — and ONLY deletion — runs as
-        # GOAdminUser. Opened on first use rather than up front: a run that never
-        # deletes anything never authenticates with the privileged account, and it
-        # cannot be reached by accident from the other operations.
-        self._oc = orchestrator_connection
-        self._go_admin_session = None
 
-    def go_delete_session(self):
-        """The privileged session, for document deletion in GO and nothing else."""
-        if self._go_admin_session is None:
-            cred = self._oc.get_credential("GOAdminUser")
-            self._oc.log_info("Opening GO admin connection (deletion only).")
-            self._go_admin_session = oomtm_go.session(cred.username, cred.password)
-        return self._go_admin_session
+    def default_unit_party_no(self) -> int | None:
+        """Afdelingen, en sag journaliseres paa, naar KontAKT ikke sender en.
+
+        MIDLERTIDIGT. Den rigtige kilde er sagens team i KontAKT, men
+        koblingen team -> F2-afdeling findes ikke i databasen endnu (den venter
+        paa afdelingstabellen og admin-siden). Indtil da: OO-constanten
+        ``F2AfdelingStandard`` med afdelingens partynummer.
+
+        Hvorfor afdelingen og ikke sagsbehandleren: "Ansvarlig enhed" i F2 er
+        udledt af den ansvarliges organisation, saa en sag med en person som
+        ansvarlig flytter afdeling, naar en vikar tager over - og robotten
+        mister sin skriveret til akterne. Maalt: enhed som ansvarlig lykkedes
+        15 af 15, en person 2 af 4.
+        """
+        try:
+            raw = (self._oc.get_constant("F2AfdelingStandard").value or "").strip()
+        except Exception:  # pylint: disable=broad-except
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            self._oc.log_info(
+                f"F2AfdelingStandard er {raw!r} og ikke et partynummer - "
+                f"ignoreres.")
+            return None
 
 
 def reset(orchestrator_connection: OrchestratorConnection) -> Client:
@@ -74,5 +92,5 @@ def kill_all(orchestrator_connection: OrchestratorConnection) -> None:
 
 def open_all(orchestrator_connection: OrchestratorConnection) -> Client:
     """Open all connections used by the robot and return them as a :class:`Client`."""
-    orchestrator_connection.log_trace("Opening GO connection.")
+    orchestrator_connection.log_trace("Opening F2 connection.")
     return Client(orchestrator_connection)
