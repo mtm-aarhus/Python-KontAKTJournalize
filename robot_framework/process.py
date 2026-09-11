@@ -313,6 +313,20 @@ def _journalize_email(oc, client, case_id, payload):
             # En mail vokser ikke, saa datoen maa gerne laase akten.
             sent=tidspunkt if udgaaende else "",
             received="" if udgaaende else tidspunkt,
+            # ARKIVERET - altsaa "journaliseret" i F2's brugerflade, og det er
+            # foerst DER akten faar sit aktnummer (maalt paa 42 akter: hver
+            # arkiveret akt har et nummer, ingen uarkiveret har et).
+            #
+            # En besked er faerdig i samme oejeblik den er sendt eller modtaget;
+            # der kommer ikke mere paa den. F2 arkiverer selv Inbound-akter, men
+            # ikke Outbound - saa den udgaaende post laa som kladde uden nummer
+            # og uden flueben, mens svaret ved siden af var journaliseret.
+            # Bemaerket i brugerfladen 2026-09-11.
+            #
+            # Det gaelder IKKE udleveringsakten: den skal blive ved med at kunne
+            # tage imod dokumenter, saa laenge afstemningen koerer. Se
+            # _udleveringsakt.
+            archived=True,
         )
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"F2 journalize_email failed: {exc!r}")
