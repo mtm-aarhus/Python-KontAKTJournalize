@@ -28,18 +28,19 @@ HVAD DER ER ANDERLEDES END GO-UDGAVEN, OG HVORFOR
         og en halv snes linjer til at oprette dem idempotent. I F2 er akten
         mappen: én akt pr. kildesag, og dokumenterne ligger paa den.
 
-    INTET KAN SLETTES. Et journaliseret dokument i F2 har ikke nogen
-        slette-relation - hverken vi eller nogen anden konto kan fjerne det. Et
-        dokument, der trækkes ud af udleveringen, bliver derfor MÆRKET
-        ("UDGÅET - ...") i stedet for at forsvinde, og aktlisten - som
-        journaliseres i samme koersel - er det autoritative indeks over hvad der
-        faktisk blev udleveret. Det er ikke en noedloesning, det er den eneste
-        vej API'et tilbyder, og den er arkivmaessigt den rigtige: sagen
-        fortaeller historien i stedet for at blive skrevet om.
+    SLETNING UDEN EN PRIVILEGERET KONTO. Et dokument, der traekkes ud af
+        udleveringen, bliver SLETTET: DELETE paa dokumentets egen URL svarer 204
+        (maalt 2026-09-10). Det virker, fordi udleveringsakten er ULAAST - vi
+        undlader SentDate med vilje. Paa en LAAST akt giver det 403, og saa
+        maerkes dokumentet "UDGÅET - ..." i stedet; se _fjern_dokument.
 
-    INGEN PRIVILEGERET KONTO. GOAdminUser fandtes for at kunne afmarkere et
-        dokument som sagsakt foer sletning. Naar der ikke kan slettes, er der
-        ingenting for den konto at lave.
+        Det stod i en periode her, at INTET kunne slettes. Det var forkert. Jeg
+        ledte efter en rel/...delete-relation, fandt ingen, og konkluderede at
+        handlingen ikke fandtes - men link-relationerne annoncerer ikke
+        almindelig HTTP DELETE. cBrain gjorde opmaerksom paa det.
+
+        GOAdminUser er stadig vaek: i GO fandtes den for at kunne AFMARKERE et
+        dokument som sagsakt foer sletning, og det trin findes ikke i F2.
 
 DET DER STADIG GAELDER
 
@@ -383,43 +384,44 @@ def _sync_en_sag(oc, client, case_id, sag, del_plan, payload) -> dict:
         return ud
     ud["f2_matter_id"] = oomtm_f2.text(akt, "Id")
 
-    # Trukket ud af udleveringen -> maerket UDGAAET. Kan ikke slettes; se
-    # modulets docstring. Rapporteres som "deleted", fordi det er praecis hvad
-    # KontAKT skal goere med sin egen henvisning: glemme den.
+    # Trukket ud af udleveringen -> SLETTET fra F2. Kun hvis akten er blevet
+    # arkiveret, faldes der tilbage paa at maerke det UDGÅET (se
+    # _fjern_dokument). Begge dele rapporteres som "deleted", fordi det er
+    # praecis hvad KontAKT skal goere med sin egen henvisning: glemme den.
     for post in (del_plan.get("delete") or []):
         try:
-            _udgaa_dokument(client, post.get("f2_document_id"))
+            _fjern_dokument(oc, client, post.get("f2_document_id"))
             ud["deleted"].append(post.get("doc_id"))
         except Exception as exc:  # pylint: disable=broad-except
-            oc.log_info(f"F2 sync: kunne ikke udgaa dokument "
+            oc.log_info(f"F2 sync: kunne ikke fjerne dokument "
                         f"{post.get('f2_document_id')}: {exc!r}")
             ud["failed"].append({"doc_id": post.get("doc_id"), "note": str(exc)[:300]})
 
     # Aendret siden det blev journaliseret: den nye laegges op, og den gamle
-    # maerkes. Raekkefoelgen er med vilje - den nye foerst, saa en fejl aldrig
-    # efterlader sagen med et maerket dokument og ingen erstatning.
+    # fjernes. Raekkefoelgen er med vilje - den nye FOERST, saa en fejl aldrig
+    # efterlader sagen uden en gyldig kopi.
     for post in (del_plan.get("replace") or []):
         if not _laeg_op(oc, client, case_id, akt, post, ud, "replaced"):
             continue
         try:
-            _udgaa_dokument(client, post.get("f2_document_id"))
+            _fjern_dokument(oc, client, post.get("f2_document_id"))
         except Exception as exc:  # pylint: disable=broad-except
             oc.log_info(f"F2 sync: den nye kopi er lagt op, men den gamle "
-                        f"({post.get('f2_document_id')}) kunne ikke maerkes: {exc!r}")
+                        f"({post.get('f2_document_id')}) blev ikke fjernet: {exc!r}")
 
     for post in (del_plan.get("upload") or []):
         _laeg_op(oc, client, case_id, akt, post, ud, "uploaded")
 
     # Dokumentlisten aendrede sig med dokumenterne, saa kopien i F2 skal vaere
-    # den nye. Den gamle maerkes, praecis som et udgaaet dokument.
+    # den nye. Den gamle fjernes, praecis som et udtrukket dokument.
     if del_plan.get("aktliste"):
         try:
             for gammel in (del_plan.get("aktliste_f2_document_ids") or []):
                 try:
-                    _udgaa_dokument(client, gammel)
+                    _fjern_dokument(oc, client, gammel)
                 except Exception as exc:  # pylint: disable=broad-except
-                    oc.log_info(f"F2 sync: gammel aktliste {gammel} kunne ikke "
-                                f"maerkes: {exc!r}")
+                    oc.log_info(f"F2 sync: gammel aktliste {gammel} blev ikke "
+                                f"fjernet: {exc!r}")
             nye = _journaliser_aktliste(oc, client, case_id, akt, src)
             if nye:
                 ud["aktliste_f2_document_ids"] = nye
@@ -513,19 +515,38 @@ def _laeg_op(oc, client, case_id, akt, post, ud, noegle) -> bool:
     return True
 
 
-def _udgaa_dokument(client, f2_document_id) -> None:
-    """Maerk et dokument som trukket ud af udleveringen.
+def _fjern_dokument(oc, client, f2_document_id) -> str:
+    """Fjern et dokument, der er trukket ud af udleveringen.
 
-    Der SLETTES ikke - et dokument i F2 har ingen slette-relation. Det maerkes
-    "UDGÅET - ..." i stedet, og det er idempotent: et dokument, der allerede er
-    maerket, bliver ikke maerket to gange.
+    Returnerer "deleted", "marked" eller "" (der var intet id).
+
+    DET BLIVER SLETTET. Maalt 2026-09-10: DELETE paa dokumentets egen URL giver
+    204, og det er vaek bagefter. Udleveringsakten er ULAAST - vi undlader
+    SentDate med vilje - og dér virker sletningen. Arkivering alene blokerer
+    ikke: en arkiveret, ulaast akt tillod ogsaa sletning.
+
+    En tidligere udgave hed _udgaa_dokument og MAERKEDE dokumentet "UDGÅET - ..."
+    i stedet, fordi jeg havde konkluderet at et journaliseret dokument ikke kunne
+    fjernes. Det var forkert: jeg ledte efter en rel/...delete-relation, fandt
+    ingen, og troede at handlingen ikke fandtes. Link-relationerne annoncerer
+    bare ikke almindelig HTTP DELETE. cBrain gjorde opmaerksom paa det.
+
+    Maerkningen er tilbage som RESERVEVEJ - se f2.remove_document. En arkiveret
+    akt giver 403, og saa er et maerket dokument stadig bedre end en fil, der ser
+    udleveret ud uden at vaere det.
     """
     raw = str(f2_document_id or "").strip()
     if not raw:
-        return
+        return ""
     url = client.f2.rel("document-by-id").replace("{id}", quote(raw))
     dok = client.f2.get(url)
-    client.f2.mark_superseded(dok)
+    udfald = client.f2.remove_document(dok)
+    if udfald == "marked":
+        # Vaerd at kunne se i loggen: sletningen er normalen, maerkningen er det
+        # afvigende, og den fortaeller at akten er blevet arkiveret.
+        oc.log_info(f"F2-dokument {raw} kunne ikke slettes - maerket UDGÅET "
+                    f"i stedet (akten er formentlig blevet laast).")
+    return udfald
 
 
 def _journaliser_aktliste(oc, client, case_id, akt, src) -> list[str]:
@@ -585,13 +606,13 @@ def _delete_doc(oc, client, case_id, payload):
     """Et dokument blev trukket ud i KontAKT. Best-effort; ingen kvittering
     (KontAKTs egen raekke er allerede vaek).
 
-    Der slettes ikke - se ``_udgaa_dokument``.
+    Slettes hvis akten tillader det - se ``_fjern_dokument``.
     """
     raw = str(payload.get("f2_document_id") or "").strip()
     oc.log_info(f"F2 delete_doc case={case_id} f2_document_id={raw}")
     if not raw:
         return
-    _udgaa_dokument(client, raw)
+    _fjern_dokument(oc, client, raw)
     oc.log_info(f"F2 delete_doc done: {raw} er maerket UDGAAET")
 
 

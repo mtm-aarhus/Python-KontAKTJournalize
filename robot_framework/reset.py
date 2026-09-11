@@ -6,10 +6,10 @@ re-opens them, so the queue framework can reconnect on a retry instead of
 reconnecting for every single document.
 
 Der er ikke laengere en privilegeret konto. GO havde GOAdminUser, fordi sletning
-af et journaliseret dokument kraevede at det foerst blev afmarkeret som sagsakt.
-I F2 findes det problem ikke - et dokument kan slet ikke slettes, uanset hvem man
-er (det HAR ingen slette-relation), saa der er ingenting for en privilegeret
-konto at lave. Se ``process._udgaa_dokument``.
+af et journaliseret dokument kraevede, at det foerst blev afmarkeret som sagsakt.
+Det trin findes ikke i F2: robotten kan slette sine egne dokumenter med et
+almindeligt DELETE, saa laenge akten ikke er arkiveret. Se
+``process._fjern_dokument``.
 """
 
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection

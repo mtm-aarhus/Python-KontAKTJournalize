@@ -8,7 +8,7 @@ modtaget ændres, når en besked sendes, og hver gang noget ændrer sig i det, d
 faktisk bliver udleveret.
 
 > Robotten talte tidligere med **GetOrganized**. F2 erstatter GO på alle
-> parametre, og GO er ude af KontAKTs kode og database. Se `F2-TESTLOG.md` i
+> parametre, og GO er ude af KontAKTs kode og database. Se `MDFiles/F2-TESTLOG.md` i
 > KontAKT-repoet for hver enkelt måling, denne robot er bygget på - intet
 > herunder er læst i en dokumentation, det er alt sammen prøvet mod
 > `aak-esdh-test-mob.f2-cloud.com`.
@@ -24,25 +24,32 @@ dokument ses som PDF, renderer F2 det (`rel/pdf-content`).
 plus kode til at oprette dem idempotent. I F2 er akten mappen.
 
 **Ingen privilegeret konto.** `GOAdminUser` fandtes for at kunne afmarkere et
-dokument som sagsakt før sletning. Der kan ikke slettes i F2, så der er
-ingenting for den konto at lave.
+dokument som sagsakt før sletning. Det trin findes ikke i F2 - robotten sletter
+sine egne dokumenter med et almindeligt `DELETE`.
 
-## Hvad der ikke kan slettes, og hvad robotten gør i stedet
+## Et dokument, der trækkes ud, bliver slettet
 
-**Et journaliseret dokument i F2 har ingen slette-relation.** Det er ikke et
-spørgsmål om rettigheder - API'et tilbyder det ikke. Målt: et dokument bærer
-`self`, `up`, `alternate`, `content`, `pdf-content`, `pdf-content-flattened`,
-`text-content`, `upload-validation`. Og en hel sag må API-brugeren ikke slette
-(403 på dry-run; selve sletningen svarer 204 og gør ingenting).
+`DELETE` på dokumentets egen `self`-URL svarer **204**, og et GET bagefter giver
+403. Målt 2026-09-10 på fem dokumenter, heraf tre som robotten selv havde
+journaliseret.
 
-Så når et dokument trækkes ud af udleveringen, eller en ny udgave erstatter det,
-**mærker** robotten det gamle: titlen bliver `UDGÅET - <titel>`. Titlen KAN
-PATCHes; det er målt. Aktlisten - som journaliseres i samme kørsel - er det
-autoritative indeks over hvad der faktisk blev udleveret.
+Det virker, fordi udleveringsakten er **ulåst** - vi undlader `SentDate` med
+vilje, se afsnittet om låsen. Arkivering alene blokerer ikke: en arkiveret, men
+ulåst akt tillod også sletning. Er akten låst, svarer F2 403, og så falder
+robotten tilbage på at **mærke** dokumentet `UDGÅET - <titel>`; titlen kan
+PATCHes. Aktlisten - som journaliseres i samme kørsel - er under alle
+omstændigheder det autoritative indeks over det udleverede.
 
-Det er ikke en nødløsning. Det er den eneste vej API'et tilbyder, og den er
-arkivmæssigt den rigtige: sagen fortæller historien i stedet for at blive
-skrevet om.
+> **Her stod det modsatte indtil 2026-09-10:** at et journaliseret dokument
+> slet ikke kunne fjernes, fordi det ingen slette-relation har. Det var forkert.
+> Jeg ledte efter en `rel/…delete`, fandt ingen, og konkluderede at handlingen
+> ikke fandtes - men link-relationerne annoncerer ikke almindelig HTTP `DELETE`.
+> **Fraværet af et link er ikke fraværet af en metode.** cBrain gjorde
+> opmærksom på det.
+
+En hel **sag** må API-brugeren derimod stadig ikke slette (403 på dry-run; selve
+sletningen svarer 204 og gør ingenting). Det kræver privilegiet *"Kan slette
+sager"* i en rolle.
 
 ## Adgang og skriveret - to betingelser, og de skal begge holde
 
@@ -103,7 +110,7 @@ Køstyret; `mode` i nyttelasten bestemmer:
   udfører den. En tabt hændelse, en fejlet kørsel eller en gentagelse kan derfor
   ikke efterlade F2 permanent forkert: næste kørsel regner det hele om fra
   aktuelle data. **En kørsel uden noget at gøre er normal.**
-- **`delete_doc`** — et dokument blev trukket ud i KontAKT; det mærkes UDGÅET.
+- **`delete_doc`** — et dokument blev trukket ud i KontAKT; det slettes i F2.
 
 ## Input
 
@@ -119,7 +126,7 @@ Køstyret; `mode` i nyttelasten bestemmer:
 | `standin_email` | de fleste | vikaren, hvis der er en; bliver også aktpart |
 | `email_id` | journalize_email | KontAKTs `case_emails`-række |
 | `source_case_id` | sync_f2 | kildesagen, der skal holdes i takt |
-| `f2_document_id` | delete_doc | dokumentet, der skal mærkes udgået |
+| `f2_document_id` | delete_doc | dokumentet, der skal fjernes |
 
 Store data hentes **fra KontAKT** og står ikke i køelementet: mailkroppen
 (`…/emails/{id}`), planen (`…/f2-journal/plan`), aktlistens rækker og filer
@@ -152,7 +159,7 @@ prøves igen uden at det, der lykkedes, går tabt.
 | Constant `F2RestTestURL` / `F2RestProdURL` | F2's vært. `https://` må gerne stå der - klienten sætter det kun på, hvis det mangler |
 | Credential `F2TESTRestAkt` / `F2PRODRestAkt` | F2REST-klientens id + hemmelighed |
 | Constant `F2BrugerTest` / `F2BrugerProd` | valgfri: F2-brugerens navn, hvis den ikke hedder som klienten |
-| Constant `F2AfdelingStandard` | **midlertidig**: afdelingens partynummer, indtil koblingen team → F2-afdeling står i KontAKTs database |
+| Constant `F2AfdelingStandard` | **midlertidig**: afdelingens partynummer, indtil koblingen team → F2-afdeling står i KontAKTs database. **Teknik og Miljø = `38`** (synknøgle 1007, slået op i F2 2026-09-09). Til sammenligning: Byggeri = 450, Digital Udvikling = 2008 |
 | Credential `KontAKTAPI` | username = base URL, password = X-API-Key |
 
 Journalplan og handlingsfacet står **ikke** i konfigurationen: de er KLE-numre og
@@ -167,12 +174,43 @@ og kopiér ud igen; `tests/test_copies.py` fejler, når de to er kommet ud af ta
 
 `oomtm[pdf]` er **ikke** længere nødvendig. F2 renderer selv til PDF.
 
+## Uafklaret: rækker en FORÆLDER-enhed ned i sine underenheder?
+
+`F2AfdelingStandard` sættes til **Teknik og Miljø (38)**, som er en rod i
+enhedstræet - Byggeri (450) og Digital Udvikling (2008) ligger under den.
+
+Det er **ikke målt**, om det virker, og den målte regel peger den forkerte vej:
+
+> `Unit` betyder **kun den ansvarliges egen enhed**. Robotten var ansvarlig,
+> akten stod på `Unit`, og Jakob kunne ikke se sagen. *(prøve D, 2026-09-07)*
+
+Prøve E viste, at en kollega **i samme enhed** som ansvarlig gav adgang. Ingen
+prøve har testet en forælder-enhed. Betyder `Unit` præcis den ene enhed og ikke
+dens undertræ, bliver hver sag journaliseret "korrekt" og er **usynlig for
+alle** - præcis fejlen fra prøve D, og den er tavs.
+
+**Prøven, der afgør det** (ét menneske, to minutter): opret én sag med
+`F2AfdelingStandard = 38`, lad robotten journalisere den, og bed en
+sagsbehandler i Byggeri eller Digital Udvikling søge den frem i F2.
+
+- **Ser de den:** enhedsadgang er hierarkisk, 38 er det rigtige valg, og alle i
+  Teknik og Miljø kan finde alle aktindsigtssager.
+- **Ser de den ikke:** brug den enhed, sagen faktisk hører til (450 for
+  Byggeri), og få koblingen team → F2-afdeling ind i KontAKTs database, som er
+  den rigtige løsning alligevel.
+
+Bemærk konsekvensen, hvis den virker: `AccessLevel=Unit` + Teknik og Miljø som
+ansvarlig giver **hele magistraten** adgang til hver aktindsigtssag. Det kan
+være præcis det, der ønskes - aktindsigtsteamet betjener hele TM - men det er en
+adgangsbeslutning, ikke en teknisk detalje.
+
 ## Uafklaret hos cBrain
 
-Se `F2-SPOERGSMAAL-TIL-CBRAIN.md` i KontAKT-repoet. Det, der berører denne robot:
+Se `MDFiles/F2-SPOERGSMAAL-TIL-CBRAIN.md` i KontAKT-repoet. Det, der berører denne robot:
 
-- Hvad er den tilsigtede måde at trække et journaliseret dokument ud? Er
-  `UDGÅET -`-mærkningen acceptabel, eller er `rel/create-new-version` svaret?
+- ~~Hvad er den tilsigtede måde at trække et journaliseret dokument ud?~~
+  **Besvaret 2026-09-10:** `DELETE` på dokumentet virker. Mærkningen er nu kun
+  reservevej for en låst akt.
 - Hvad skiller de to `Unit`-akter med en person som ansvarlig, hvor den ene
   virker og den anden ikke?
 - Hvad er det rigtige kald til `set-documents-locked`?
