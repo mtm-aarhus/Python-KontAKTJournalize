@@ -36,8 +36,19 @@ def handle_error(message: str, error: Exception, queue_element: QueueElement | N
         queue_element: The queue element to fail, if any.
         orchestrator_connection: A connection to OpenOrchestrator.
     """
-    error_msg = f"{message}: {repr(error)}\n\nTrace:\n{traceback.format_exc()}"
-    error_msg = error_msg[:490]+error_msg[-500:]
+    raw_msg = f"{message}: {repr(error)}\n\nTrace:\n{traceback.format_exc()}"
+    # OO's message-kolonne tager 1000 tegn, og et traceback er let laengere.
+    # Der klippes i MIDTEN og ikke i enden: den faktiske undtagelse staar
+    # NEDERST i et traceback, saa en simpel afklipning ville smide netop den
+    # linje vaek og efterlade en fejlbesked, der ikke siger hvad der gik galt.
+    # 497 + skillelinjen (5) + 497 = 999.
+    #
+    # Her stod foer: error_msg[:490] + error_msg[-500:] - uden laengdetjek.
+    # For en KORT besked gav de to udsnit begge hele teksten, saa hver eneste
+    # almindelige fejl blev skrevet TO gange uden skillelinje. Det ramte ikke
+    # kun de lange. Rettet 2026-09-11.
+    error_msg = (f"{raw_msg[:497]}\n...\n{raw_msg[-497:]}"
+                 if len(raw_msg) > 999 else raw_msg)
     error_email = orchestrator_connection.get_constant(config.ERROR_EMAIL).value
 
     orchestrator_connection.log_error(error_msg)
