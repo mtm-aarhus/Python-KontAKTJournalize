@@ -198,7 +198,7 @@ def _create_case(oc, client, case_id, payload):
     allerede = client.f2.find_case(ekstern)
     if allerede and (allerede.get("CaseNumber") or "").strip():
         nummer = allerede["CaseNumber"].strip()
-        oc.log_info(f"F2 create_case: {ekstern} sidder allerede paa sag "
+        oc.log_info(f"F2 create_case: {ekstern} sidder allerede på sag "
                     f"{nummer} - opretter ikke en ny.")
         sag = client.f2.case_by_number(nummer)
         _callback(oc, client, path,
@@ -388,12 +388,12 @@ def _sync_en_sag(oc, client, case_id, sag, del_plan, payload) -> dict:
           "deleted": [], "kept": del_plan.get("keep") or [], "failed": []}
     oc.log_info(f"F2 sync {src}: {len(del_plan.get('upload') or [])} ny, "
                 f"{len(del_plan.get('replace') or [])} erstat, "
-                f"{len(del_plan.get('delete') or [])} udgaa.")
+                f"{len(del_plan.get('delete') or [])} udgår.")
 
     try:
         akt = _udleveringsakt(oc, client, sag, del_plan, payload)
     except Exception as exc:  # pylint: disable=broad-except
-        oc.log_info(f"F2 sync: kunne ikke faa en akt til {src}: {exc!r}")
+        oc.log_info(f"F2 sync: kunne ikke få en akt til {src}: {exc!r}")
         ud["failed"].append({"doc_id": None, "note": f"Akten: {exc}"[:300]})
         return ud
     ud["f2_matter_id"] = oomtm_f2.text(akt, "Id")
@@ -443,8 +443,8 @@ def _sync_en_sag(oc, client, case_id, sag, del_plan, payload) -> dict:
             oc.log_info(f"F2 sync: aktlisten for {src} fejlede: {exc!r}")
             ud["failed"].append({"doc_id": None, "note": f"Aktliste: {exc}"[:300]})
 
-    oc.log_info(f"F2 sync {src} faerdig: {len(ud['uploaded'])} lagt op, "
-                f"{len(ud['replaced'])} erstattet, {len(ud['deleted'])} udgaaet, "
+    oc.log_info(f"F2 sync {src} færdig: {len(ud['uploaded'])} lagt op, "
+                f"{len(ud['replaced'])} erstattet, {len(ud['deleted'])} udgået, "
                 f"{len(ud['failed'])} fejlede.")
     return ud
 
@@ -471,13 +471,13 @@ def _udleveringsakt(oc, client, sag, del_plan, payload):
             akt = client.f2.get(client.f2.rel("matter-by-id").replace("{id}", kendt))
             if not client.f2.locked(akt):
                 return akt
-            oc.log_info(f"F2 sync: akt {kendt} er laast for nye dokumenter - "
-                        f"laegger en ny akt paa {src}.")
+            oc.log_info(f"F2 sync: akt {kendt} er låst for nye dokumenter - "
+                        f"lægger en ny akt på {src}.")
         except oomtm_f2.F2Error as exc:
             # 403 daekker baade "findes ikke" og "maa du ikke se" - F2 skelner
             # ikke. Begge betyder, at vi ikke kan bruge den akt.
             oc.log_info(f"F2 sync: akt {kendt} kunne ikke bruges "
-                        f"({exc.status}) - laegger en ny paa.")
+                        f"({exc.status}) - lægger en ny på.")
 
     akt, ny = client.f2.create_matter(
         sag, kind=UDLEVERING_TYPE,
@@ -520,7 +520,7 @@ def _laeg_op(oc, client, case_id, akt, post, ud, noegle) -> bool:
             filename=navn, data=data, content_type=_content_type(navn),
             description="Udleveret som aktindsigt (KontAKT)")
     except Exception as exc:  # pylint: disable=broad-except
-        oc.log_info(f"F2 sync: doc={doc_id} kunne ikke laegges paa: {exc!r}")
+        oc.log_info(f"F2 sync: doc={doc_id} kunne ikke lægges på: {exc!r}")
         ud["failed"].append({"doc_id": doc_id, "note": str(exc)[:300]})
         return False
     ud[noegle].append({"doc_id": doc_id,
@@ -558,8 +558,8 @@ def _fjern_dokument(oc, client, f2_document_id) -> str:
     if udfald == "marked":
         # Vaerd at kunne se i loggen: sletningen er normalen, maerkningen er det
         # afvigende, og den fortaeller at akten er blevet arkiveret.
-        oc.log_info(f"F2-dokument {raw} kunne ikke slettes - maerket UDGÅET "
-                    f"i stedet (akten er formentlig blevet laast).")
+        oc.log_info(f"F2-dokument {raw} kunne ikke slettes - mærket UDGÅET "
+                    f"i stedet (akten er formentlig blevet låst).")
     return udfald
 
 
@@ -608,7 +608,7 @@ def _journaliser_aktliste(oc, client, case_id, akt, src) -> list[str]:
     _callback(oc, client, path, {"ok": True, "source_case_id": src,
                                  "content_token": token,
                                  "f2_document_ids": nye})
-    oc.log_info(f"Aktliste opdateret for {sagsnummer}: {len(raekker)} raekker, "
+    oc.log_info(f"Aktliste opdateret for {sagsnummer}: {len(raekker)} rækker, "
                 f"2 filer.")
     return nye
 
@@ -627,7 +627,7 @@ def _delete_doc(oc, client, case_id, payload):
     if not raw:
         return
     _fjern_dokument(oc, client, raw)
-    oc.log_info(f"F2 delete_doc done: {raw} er maerket UDGAAET")
+    oc.log_info(f"F2 delete_doc done: {raw} er mærket UDGÅET")
 
 
 # ----- sagen -----------------------------------------------------------------
@@ -648,12 +648,12 @@ def _case(oc, client, case_id, payload, plan=None):
         sag = client.f2.case_by_number(nummer)
         if sag is not None:
             return sag
-        oc.log_info(f"F2: sagsnummer {nummer!r} gav intet - proever ExternalId.")
+        oc.log_info(f"F2: sagsnummer {nummer!r} gav intet - prøver ExternalId.")
     raekke = client.f2.find_case(f"KontAKT-{case_id}")
     if not raekke:
         return None
     fundet = (raekke.get("CaseNumber") or "").strip()
-    oc.log_info(f"F2: fandt sagen paa ExternalId (nummer {fundet!r}).")
+    oc.log_info(f"F2: fandt sagen på ExternalId (nummer {fundet!r}).")
     return client.f2.case_by_number(fundet) if fundet else None
 
 
