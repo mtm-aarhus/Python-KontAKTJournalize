@@ -68,6 +68,7 @@ from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConn
 from OpenOrchestrator.database.queues import QueueElement
 from urllib.parse import quote
 import json
+import re
 
 import requests
 
@@ -270,16 +271,29 @@ def _update_metadata(oc, client, case_id, payload):
 
 
 def _journalize_email(oc, client, case_id, payload):
-    """Én besked bliver én akt.
+    """Én besked bliver én akt - med alle sine vedhaeftninger.
 
     Mailen renderes IKKE til PDF. En akt i F2 er et stykke korrespondance: den
     har ``Text`` (HTML), afsender, modtagere og datoer, og det er praecis en
     mail. GO kunne kun tage filer, og derfor skulle mailen igennem LibreOffice
     foerst - den omvej er vaek.
 
-    Vedhaeftninger foelger ikke med. Det er samme afgraensning som i
-    GO-udgaven: KontAKTs mail-endpoint giver kroppen, ikke filerne. De
-    vedhaeftninger, der ER en del af udleveringen, journaliseres af ``sync_f2``.
+    VEDHAEFTNINGERNE LAEGGES PAA AKTEN. Tidligere stod her, at de ikke fulgte
+    med, og det betoed at et foto eller en PDF, ansoegeren sendte, kun fandtes i
+    KontAKT. Maalt 2026-09-25: F2's laas er append-only - en laast akt tager
+    imod nye dokumenter, den naegter bare at fjerne dem. Saa filerne kan lægges
+    paa, efter akten er oprettet som altid.
+
+    DEN HER FUNKTION SKAL KUNNE KOERE IGEN. Den bliver kaldt igen, hver gang en
+    indgaaende mails filer lander i KontAKT (de kommer EFTER selve mailen), og
+    koeelementer proeves igen ved fejl. Hver koersel skal derfor ende det samme
+    sted: én akt, og hver vedhaeftning én gang.
+
+    Det er svaerere end det lyder, fordi PEO kun beskytter et forsoeg igen INDE
+    I ét kald. En ny koersel beder om en ny engangs-URL og faar en NY akt. Og en
+    dublet kan aldrig fjernes igen, fordi akten er laast mod at fjerne noget.
+    Saa der holdes styr paa, hvad der er lavet, to steder - se ``_mail_akt`` og
+    ``_vedhaeftninger``.
     """
     email_id = int(payload["email_id"])
     path = f"/api/v1/cases/{case_id}/emails/{email_id}/journalized"
@@ -292,50 +306,189 @@ def _journalize_email(oc, client, case_id, payload):
                 f"{oomtm_f2.text(sag, 'CaseNumber')}")
     try:
         mail = _kontakt_get(client, f"/api/v1/cases/{case_id}/emails/{email_id}")
-        udgaaende = (mail.get("direction") or "") == "outbound"
-        emne = (mail.get("subject") or f"E-mail {email_id}").strip()
-        krop = mail.get("body_html") or _som_html(mail.get("body_text"))
-        tidspunkt = _f2_dato(mail.get("sent_at"))
-        modtagere = [oomtm_f2.party(email=m) for m in
-                     _adresser(mail.get("to_addresses"))]
-        afsender = (oomtm_f2.party(email=_adresser(mail.get("from_address"))[0])
-                    if _adresser(mail.get("from_address")) else None)
-
-        akt, ny = client.f2.create_matter(
-            sag,
-            kind=oomtm_f2.OUTBOUND if udgaaende else oomtm_f2.INBOUND,
-            title=emne[:255],
-            text=krop,
-            responsible=_unit(client, payload),
-            involved=_people(payload) or None,
-            sender=afsender,
-            receivers=modtagere or None,
-            # En mail vokser ikke, saa datoen maa gerne laase akten.
-            sent=tidspunkt if udgaaende else "",
-            received="" if udgaaende else tidspunkt,
-            # ARKIVERET - altsaa "journaliseret" i F2's brugerflade, og det er
-            # foerst DER akten faar sit aktnummer (maalt paa 42 akter: hver
-            # arkiveret akt har et nummer, ingen uarkiveret har et).
-            #
-            # En besked er faerdig i samme oejeblik den er sendt eller modtaget;
-            # der kommer ikke mere paa den. F2 arkiverer selv Inbound-akter, men
-            # ikke Outbound - saa den udgaaende post laa som kladde uden nummer
-            # og uden flueben, mens svaret ved siden af var journaliseret.
-            # Bemaerket i brugerfladen 2026-09-11.
-            #
-            # Det gaelder IKKE udleveringsakten: den skal blive ved med at kunne
-            # tage imod dokumenter, saa laenge afstemningen koerer. Se
-            # _udleveringsakt.
-            archived=True,
-        )
+        akt, ny = _mail_akt(oc, client, sag, mail, payload)
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"F2 journalize_email failed: {exc!r}")
         _callback(oc, client, path, {"ok": False, "note": str(exc)[:400]})
         raise
     akt_id = oomtm_f2.text(akt, "Id")
+
+    # Aktens id meldes STRAKS - foer vedhaeftningerne. Doer koerslen midt i en
+    # stor fil, ved KontAKT i det mindste, hvilken akt mailen er, og den naeste
+    # koersel genbruger den i stedet for at oprette en til.
     _callback(oc, client, path, {"ok": True, "doc_id": akt_id})
+
+    meldt = _vedhaeftninger(oc, client, case_id, email_id, sag, akt, ny, mail)
+    if meldt:
+        _callback(oc, client, path, {"ok": True, "doc_id": akt_id,
+                                     "attachments": meldt})
     oc.log_info(f"F2 journalize_email done email={email_id} akt={akt_id} "
-                f"({'ny' if ny else 'fandtes'})")
+                f"({'ny' if ny else 'fandtes'}), {len(meldt)} vedhæftning(er)")
+
+
+# Maerket paa et dokument, robotten selv har lagt paa en mail-akt. Staar i
+# ``Description``, fordi det er det eneste frie felt, F2 giver tilbage: strukturen
+# viser hverken beskrivelse eller filnavn, kun ``Title``, ``Size`` og
+# ``ContentType`` (maalt 2026-09-25). Titlen er det, sagsbehandleren laeser, og
+# den skal vaere filens navn - ikke et id.
+MAERKE = "Vedhæftet mailen (KontAKT-vedhæftning {id})"
+MAERKE_RE = re.compile(r"KontAKT-vedhæftning (\d+)")
+
+
+def _mail_akt(oc, client, sag, mail, payload):
+    """Akten, mailen er - genbrugt, hvis den findes. Returnerer (akt, ny).
+
+    Tre veje, i den raekkefoelge:
+
+      1. KontAKT kender aktens id. Den slaas op. Kan den ikke hentes, siges der
+         fra: at lave en ny ville vaere en dublet, der ikke kan fjernes igen.
+      2. KontAKT kender den IKKE - men den kan alligevel findes. Det er vinduet,
+         hvor F2 oprettede akten, og koerslen doede, foer den naaede at sige det.
+         Saa ledes der paa sagen efter en akt med samme titel OG samme dato.
+      3. Ellers oprettes den.
+    """
+    kendt = str(mail.get("f2_document_id") or "").strip()
+    if kendt:
+        try:
+            return client.f2.get(client.f2.rel("matter-by-id").replace("{id}", kendt)), False
+        except oomtm_f2.F2Error as exc:
+            raise RuntimeError(
+                f"Mailen er journaliseret som akt {kendt}, men den kan ikke hentes "
+                f"({exc.status}). Der oprettes IKKE en ny: akten er låst mod at "
+                f"fjerne noget, så en dublet kan aldrig ryddes op. Tjek akten i F2 - "
+                f"er den slettet med vilje, så ryd case_emails.f2_document_id.") from exc
+
+    udgaaende = (mail.get("direction") or "") == "outbound"
+    emne = (mail.get("subject") or f"E-mail {mail.get('id')}").strip()[:255]
+    # Den rigtige dato for hver retning. Her stod sent_at for BEGGE - og en
+    # indgaaende mail har ingen sent_at, saa den kom i F2 uden dato, og F2
+    # stemplede selv journaliseringstidspunktet som modtagelsesdato.
+    tidspunkt = _f2_dato(mail.get("sent_at") if udgaaende else mail.get("received_at"))
+
+    fundet = _find_mail_akt(client, sag, emne, tidspunkt,
+                            "SentDate" if udgaaende else "ReceivedDate")
+    if fundet is not None:
+        oc.log_info(f"F2 journalize_email: fandt akt {oomtm_f2.text(fundet, 'Id')} "
+                    f"fra en tidligere kørsel - genbruger den.")
+        return fundet, False
+
+    modtagere = [oomtm_f2.party(email=m) for m in _adresser(mail.get("to_addresses"))]
+    afsender = (oomtm_f2.party(email=_adresser(mail.get("from_address"))[0])
+                if _adresser(mail.get("from_address")) else None)
+    return client.f2.create_matter(
+        sag,
+        kind=oomtm_f2.OUTBOUND if udgaaende else oomtm_f2.INBOUND,
+        title=emne,
+        text=mail.get("body_html") or _som_html(mail.get("body_text")),
+        responsible=_unit(client, payload),
+        involved=_people(payload) or None,
+        sender=afsender,
+        receivers=modtagere or None,
+        # En mail vokser ikke med ny TEKST, saa datoen maa gerne laase akten.
+        # Laasen forhindrer ikke vedhaeftningerne: den er append-only.
+        sent=tidspunkt if udgaaende else "",
+        received="" if udgaaende else tidspunkt,
+        # ARKIVERET - altsaa "journaliseret" i F2's brugerflade, og det er
+        # foerst DER akten faar sit aktnummer (maalt paa 42 akter: hver
+        # arkiveret akt har et nummer, ingen uarkiveret har et). F2 arkiverer
+        # selv Inbound-akter, men ikke Outbound - saa den udgaaende post laa som
+        # kladde uden nummer, mens svaret ved siden af var journaliseret.
+        # Bemaerket i brugerfladen 2026-09-11.
+        archived=True,
+    )
+
+
+def _find_mail_akt(client, sag, titel: str, tidspunkt: str, datofelt: str):
+    """En akt paa sagen med denne titel og denne dato - eller None.
+
+    Titel ALENE ville ikke vaere nok: "Sv: giv mig aktindsigt" staar paa mange
+    akter. Titel OG dato til sekundet er et menneske, der skriver to svar med
+    samme emne i samme sekund - det sker ikke. Uden dato (ingen at sammenligne
+    med) findes der intet, og saa oprettes akten som foer.
+    """
+    if not tidspunkt:
+        return None
+    # Strukturens akt-noder baerer baade Title, SentDate og ReceivedDate (maalt
+    # 2026-09-25), saa der sammenlignes uden et GET pr. akt. Kun den ene, der
+    # passer, hentes helt - add_document skal bruge dens egne links.
+    for kandidat in oomtm_f2.matters(client.f2.structure(sag)):
+        if (oomtm_f2.text(kandidat, "Title") or "").strip() != titel:
+            continue
+        if (oomtm_f2.text(kandidat, datofelt) or "")[:19] != tidspunkt[:19]:
+            continue
+        return client.f2.get(oomtm_f2.links(kandidat)["self"])
+    return None
+
+
+def _vedhaeftninger(oc, client, case_id, email_id, sag, akt, ny, mail) -> list:
+    """Laeg mailens filer paa akten. Returnerer [{id, f2_document_id}] til KontAKT.
+
+    Hver fil én gang. KontAKT ved, hvad der er meldt tilbage; men en koersel kan
+    doe EFTER F2 tog imod filen og FOER den naaede at melde det, og saa ville
+    naeste koersel lægge den paa igen - som en dublet, der aldrig kan fjernes.
+    Derfor laeses maerkerne paa aktens dokumenter ogsaa, naar akten ikke er ny.
+    En ny akt er tom, saa der er intet at laese.
+    """
+    mangler = [a for a in (mail.get("attachments") or []) if not a.get("f2_document_id")]
+    if not mangler:
+        return []
+    allerede = {} if ny else _maerker_paa(client, sag, akt)
+
+    meldt = []
+    for a in mangler:
+        aid = int(a["id"])
+        if aid in allerede:
+            meldt.append({"id": aid, "f2_document_id": allerede[aid]})
+            continue
+        if not a.get("has_file"):
+            # Indgaaende mails filer kommer én ad gangen EFTER mailen. KontAKT
+            # beder om en ny koersel, naar filen er landet.
+            oc.log_info(f"F2 journalize_email: vedhæftning {aid} er ikke hentet "
+                        f"endnu - kommer med, når den lander.")
+            continue
+        try:
+            data = _kontakt_bytes(
+                client, f"/api/v1/cases/{case_id}/emails/{email_id}/attachments/{aid}/file")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 410:
+                oc.log_info(f"F2 journalize_email: vedhæftning {aid} har ingen fil "
+                            f"i KontAKT endnu.")
+                continue
+            raise
+        navn = (a.get("file_name") or f"vedhaeftning-{aid}").strip()
+        dok, _ = client.f2.add_document(
+            akt,
+            # Titlen er den, sagsbehandleren ser, og uden endelse - cBrain
+            # anbefaler det, og titlen maa baere æøå, hvilket et filnavn i en
+            # multipart-header ikke maa.
+            title=_uden_endelse(navn),
+            filename=navn, data=data,
+            content_type=a.get("content_type") or _content_type(navn),
+            description=MAERKE.format(id=aid))
+        meldt.append({"id": aid, "f2_document_id": oomtm_f2.text(dok, "Id")})
+    return meldt
+
+
+def _maerker_paa(client, sag, akt) -> dict:
+    """{kontakt-vedhaeftnings-id: f2-dokument-id} for dokumenterne paa akten.
+
+    Ét GET pr. dokument, fordi beskrivelsen kun staar paa dokumentet selv og
+    ikke i strukturen. Koeres kun paa en akt, der fandtes i forvejen - altsaa
+    paa et forsoeg igen, hvor det netop er vaerd at betale for.
+    """
+    akt_id = oomtm_f2.text(akt, "Id")
+    ud = {}
+    for kandidat in oomtm_f2.matters(client.f2.structure(sag)):
+        if oomtm_f2.text(kandidat, "Id") != akt_id:
+            continue
+        for d in oomtm_f2.documents(kandidat):
+            selv = oomtm_f2.links(d).get("self")
+            if not selv:
+                continue
+            m = MAERKE_RE.search(oomtm_f2.text(client.f2.get(selv), "Description") or "")
+            if m:
+                ud[int(m.group(1))] = oomtm_f2.text(d, "Id")
+    return ud
 
 
 # ----- sync_f2: afstemningen --------------------------------------------------
@@ -455,10 +608,16 @@ def _udleveringsakt(oc, client, sag, del_plan, payload):
     Tre veje ind, i den raekkefoelge:
 
       1. KontAKT har gemt aktens id fra sidste koersel - slaa den op.
-      2. Er den akt LAAST, kan der ikke laegges mere paa den, og laasen kan ikke
-         aabnes (``set-documents-locked`` svarer 400/500). Saa laegges en ny akt
-         paa i stedet. Det er den samme regel som for en akt, der er blevet
-         urørlig: læg en ny på frem for at kæmpe med den gamle.
+      2. Er den akt LAAST, laegges en ny akt paa i stedet, og laasen kan ikke
+         aabnes (``set-documents-locked`` svarer 400/500).
+
+         Grunden er SLETNING, ikke tilfoejelse. Her stod foer, at en laast akt
+         ikke kunne tage imod flere dokumenter - det er forkert. Maalt
+         2026-09-25: laasen er append-only, og en laast akt tager fint imod nye.
+         Men afstemningen skal ogsaa kunne FJERNE et dokument, der ikke laengere
+         udleveres, og det naegter en laast akt (DELETE -> 403). En
+         udleveringsakt, der kun kan vokse, ville vise mere, end der blev
+         udleveret.
       3. Ellers oprettes den.
 
     Akten findes IKKE paa sin titel. Titlen er vores egen tekst, og et menneske
@@ -471,8 +630,8 @@ def _udleveringsakt(oc, client, sag, del_plan, payload):
             akt = client.f2.get(client.f2.rel("matter-by-id").replace("{id}", kendt))
             if not client.f2.locked(akt):
                 return akt
-            oc.log_info(f"F2 sync: akt {kendt} er låst for nye dokumenter - "
-                        f"lægger en ny akt på {src}.")
+            oc.log_info(f"F2 sync: akt {kendt} er låst, så dokumenter kan ikke "
+                        f"fjernes fra den - lægger en ny akt på {src}.")
         except oomtm_f2.F2Error as exc:
             # 403 daekker baade "findes ikke" og "maa du ikke se" - F2 skelner
             # ikke. Begge betyder, at vi ikke kan bruge den akt.
