@@ -30,7 +30,10 @@ dependencies = [
     "OpenOrchestrator == 3.*",
     # KontAKT renders the aktliste now (GET /api/v1/cases/<id>/aktliste.pdf),
     # so the "reports" extra (openpyxl + reportlab) is no longer needed here.
-    "oomtm @ git+https://github.com/mtm-aarhus/oomtm.git@e4cc2d7c4f5090b78688ebab0a0eed624ddd1df1",
+    # oomtm 07008ca: F2.add_involved og F2.ensure_responsible_unit, som giver
+    # alle på sagen adgang til akter, KontAKT allerede har lavet. Commit'en har
+    # også oomtm's egne låste afhængigheder (fra e27ec60).
+    "oomtm @ git+https://github.com/mtm-aarhus/oomtm.git@07008cae0c86090ca336f0148496ee5ef0694b4c",
     "requests == 2.34.2",
     "Pillow == 10.4.0",
 ]

@@ -8,7 +8,11 @@ journalises the correspondence + the final delivery onto it. Mode is set by
                         undtaget fra postliste) with the team's department as
                         responsible. Calls back with the case number AND the
                         address F2 itself gives the case (``f2t://case/<id>``).
-* ``update_metadata`` - Emne / frist / afdeling changed in KontAKT.
+* ``update_metadata`` - Emne / frist / afdeling changed in KontAKT - or someone
+                        came on the case. Every akt KontAKT put on the case gets
+                        the missing people as aktparter and the team's unit as
+                        responsible, so a person added later sees the akter
+                        made before them (see "adgangen til akterne").
 * ``journalize_email``- one message becomes one akt. The e-mail body IS the
                         akt's text; no PDF is rendered.
 * ``sync_f2``         - the reconciliation: bring the delivered documents and
@@ -159,19 +163,153 @@ def _unit(client, payload) -> dict:
     return oomtm_f2.party(party_no=int(nummer))
 
 
+def _folk(payload) -> list:
+    """Alle, der arbejder på sagen i KontAKT, som ``[(mail, navn), ...]``.
+
+    ``involved`` er KontAKTs liste: sagsbehandleren, de andre på sagen og dem,
+    der har en af dens sager. Den er kommet til 2026-11-24; et køelement fra
+    før har kun ``caseworker_email`` og ``standin_email``, og så bruges de.
+    """
+    ud, sete = [], set()
+    if "involved" in payload:
+        kilde = []
+        for p in payload.get("involved") or []:
+            if isinstance(p, dict):
+                kilde.append((p.get("email"), p.get("name")))
+            else:
+                kilde.append((p, ""))
+    else:
+        kilde = [(payload.get("caseworker_email"), ""),
+                 (payload.get("standin_email"), "")]
+    for mail, navn in kilde:
+        m = str(mail or "").strip()
+        if m and m.lower() not in sete:
+            sete.add(m.lower())
+            ud.append((m, str(navn or "").strip()))
+    return ud
+
+
 def _people(payload) -> list:
-    """Aktparterne: sagsbehandleren og en eventuel vikar.
+    """Aktparterne: alle på sagen (se ``_folk``).
 
     DET er det, der giver dem adgang - ikke sagens partsfelter. En mailadresse
     er nok; F2 opløser den til den interne bruger (selv om opslags-endpointet
     ``party-by-email`` svarer 404 for interne, er det to forskellige kodeveje).
     """
-    mails = []
-    for noegle in ("caseworker_email", "standin_email"):
-        m = str(payload.get(noegle) or "").strip()
-        if m and m not in mails:
-            mails.append(m)
-    return [oomtm_f2.party(email=m) for m in mails]
+    return [oomtm_f2.party(email=m) for m, _ in _folk(payload)]
+
+
+# ----- adgangen til akterne --------------------------------------------------
+#
+# HVORFOR DET HER FINDES (2026-11-24): en akt får sine aktparter, når den
+# oprettes - og aktparter er det, der giver adgang. Kom nogen på sagen
+# BAGEFTER, kunne de ikke se de akter, der var lavet inden. Det ramte netop den
+# første akt: en sag oprettet uden sagsbehandler fik en anmodnings-akt uden
+# parter og på reserveafdelingen, og den, der tog sagen, så kun akterne efter.
+#
+# Nu går robotten tilbage over hver akt, KontAKT har lagt på sagen, og lægger
+# dem på, der mangler. Den fjerner aldrig nogen.
+#
+# OG KØELEMENTET ER ET ØJEBLIKSBILLEDE. En anmodning, der blev sat i kø, før
+# nogen tog sagen, men kører efter, ville stadig blive oprettet uden
+# sagsbehandler. Derfor spørger robotten KontAKT, hvem der er på sagen NU, når
+# den kører - og bruger kun køelementets værdier, hvis KontAKT ikke svarer.
+
+
+def _frisk(oc, client, case_id, payload, adgang=None) -> dict:
+    """Nyttelasten med KontAKTs adgang, som den er nu.
+
+    ``adgang`` kan komme med i et svar, robotten alligevel har hentet (mailen,
+    planen); ellers hentes den. Svarer KontAKT ikke - en ældre KontAKT uden
+    ruten - bruges køelementets egne værdier, som før.
+    """
+    if adgang is None:
+        try:
+            adgang = _kontakt_get(client, f"/api/v1/cases/{case_id}/f2-journal/adgang")
+        except CaseDeleted:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            oc.log_info(f"F2: kunne ikke hente sagens adgang fra KontAKT ({exc!r}) "
+                        f"- bruger køelementets.")
+            return payload
+    if not isinstance(adgang, dict):
+        return payload
+    ud = dict(payload)
+    for noegle in ("involved", "f2_unit_party_no", "f2_unit_name", "akt_ids"):
+        if noegle in adgang:
+            ud[noegle] = adgang[noegle]
+    return ud
+
+
+def _sikr_adgang(oc, client, akt, payload) -> dict:
+    """Læg dem på akten, der mangler, og flyt den til teamets afdeling.
+
+    Returnerer hvad der skete: ``{"id", "tilfoejet", "afvist", "flyttet",
+    "advarsel"}``. Kaster, hvis aktparterne ikke kunne sættes - det er dem,
+    der giver adgang, og en akt nogen ikke kan se, skal ses på.
+
+    Afdelingen er anderledes: lykkes flytningen ikke, står akten stadig på en
+    afdeling og med sine parter, så sagsbehandlerne kan se den. Det meldes, men
+    stopper ikke resten.
+    """
+    ud = {"id": oomtm_f2.text(akt, "Id"), "tilfoejet": [], "afvist": [],
+          "flyttet": False}
+    if not hasattr(client.f2, "add_involved"):
+        # Robotten er udrullet, men pyproject.toml peger stadig på en oomtm fra
+        # før 2026-11-24. Det skal kunne ses, ikke gå stille forbi.
+        raise RuntimeError("oomtm er for gammel til at rette adgangen til akterne "
+                           "(mangler F2.add_involved). Opdatér oomtm-versionen i "
+                           "robottens pyproject.toml.")
+    folk = _folk(payload)
+    if folk:
+        akt, ud["tilfoejet"], ud["afvist"] = client.f2.add_involved(akt, folk)
+    enhed = payload.get("f2_unit_party_no")
+    if enhed:
+        try:
+            akt, ud["flyttet"] = client.f2.ensure_responsible_unit(
+                akt, int(enhed), name=str(payload.get("f2_unit_name") or ""))
+        except Exception as exc:  # pylint: disable=broad-except
+            oc.log_info(f"F2: akt {ud['id']} kunne ikke flyttes til afdeling "
+                        f"{enhed}: {exc!r}")
+            ud["advarsel"] = f"Afdelingen: {exc}"[:300]
+    if ud["tilfoejet"] or ud["flyttet"]:
+        oc.log_info(f"F2: akt {ud['id']} - aktparter tilføjet: "
+                    f"{', '.join(ud['tilfoejet']) or 'ingen'}"
+                    f"{', flyttet til afdeling ' + str(enhed) if ud['flyttet'] else ''}.")
+    return ud
+
+
+def _ret_adgang(oc, client, payload) -> dict:
+    """Gå hver akt igennem, KontAKT har lagt på sagen. Kaster aldrig - hver
+    fejl lander i ``failed``, så resten bliver gjort."""
+    ud = {"akter": 0, "aendret": [], "failed": [], "advarsler": []}
+    for akt_id in payload.get("akt_ids") or []:
+        akt_id = str(akt_id or "").strip()
+        if not akt_id:
+            continue
+        ud["akter"] += 1
+        try:
+            akt = client.f2.get(client.f2.rel("matter-by-id").replace("{id}", quote(akt_id)))
+        except oomtm_f2.F2Error as exc:
+            # 403 dækker både "findes ikke" og "må du ikke se" - F2 skelner ikke.
+            ud["failed"].append({"akt_id": akt_id,
+                                 "note": f"Akten kunne ikke hentes ({exc.status})."})
+            continue
+        try:
+            r = _sikr_adgang(oc, client, akt, payload)
+        except Exception as exc:  # pylint: disable=broad-except
+            oc.log_info(f"F2: aktparterne på akt {akt_id} kunne ikke sættes: {exc!r}")
+            ud["failed"].append({"akt_id": akt_id, "note": str(exc)[:300]})
+            continue
+        if r["tilfoejet"] or r["flyttet"]:
+            ud["aendret"].append({"akt_id": akt_id, "tilfoejet": r["tilfoejet"],
+                                  "flyttet": r["flyttet"]})
+        if r["afvist"]:
+            ud["failed"].append({"akt_id": akt_id,
+                                 "note": "F2 kender ikke: " + ", ".join(r["afvist"])})
+        if r.get("advarsel"):
+            ud["advarsler"].append({"akt_id": akt_id, "note": r["advarsel"]})
+    return ud
 
 
 # ----- create_case -----------------------------------------------------------
@@ -208,6 +346,9 @@ def _create_case(oc, client, case_id, payload):
                                    if sag is not None else "")})
         return
 
+    # Hvem der er på sagen NU - ikke da den blev sat i kø. Den kan være taget
+    # i mellemtiden.
+    payload = _frisk(oc, client, case_id, payload)
     try:
         sag, ny = client.f2.create_case(
             title=title,
@@ -242,6 +383,14 @@ def _create_case(oc, client, case_id, payload):
 
 
 def _update_metadata(oc, client, case_id, payload):
+    """Sagens felter - og adgangen til ALLE dens akter.
+
+    KontAKT sender den her, når emne, frist eller modtaget ændres, OG når nogen
+    kommer på sagen eller den skifter team. Sagens egne felter giver ingen
+    adgang (målt), så det er akterne, der skal rettes: hver akt, KontAKT har
+    lagt på sagen, får dem, der mangler, som aktparter, og flyttes til teamets
+    afdeling. Se ``_ret_adgang``.
+    """
     path = f"/api/v1/cases/{case_id}/f2-journal/updated"
     sag = _case(oc, client, case_id, payload)
     if sag is None:
@@ -250,21 +399,47 @@ def _update_metadata(oc, client, case_id, payload):
         return
     oc.log_info(f"F2 update_metadata for {oomtm_f2.text(sag, 'CaseNumber')} "
                 f"(case {case_id})")
+    payload = _frisk(oc, client, case_id, payload)
+    # Afdelingen sendes kun med, naar teamet har en - ellers ville en sag uden
+    # team flytte til reserveafdelingen ved hver titelrettelse.
+    afdeling = (_unit(client, payload)
+                if payload.get("f2_unit_party_no") else None)
+    sag_fejl = ""
     try:
-        # Afdelingen sendes kun med, naar KontAKT faktisk har skiftet team -
-        # ellers ville hver titelrettelse ogsaa skrive den ansvarlige, og en
-        # skrivning, der ikke behoeves, er en skrivning der kan gaa galt.
-        afdeling = (_unit(client, payload)
-                    if payload.get("f2_unit_party_no") else None)
-        client.f2.update_case(sag, title=str(payload.get("title") or "").strip(),
-                              deadline=str(payload.get("deadline") or "").strip(),
-                              responsible=afdeling,
-                              supplementary=_people(payload) or None)
+        try:
+            client.f2.update_case(sag, title=str(payload.get("title") or "").strip(),
+                                  deadline=str(payload.get("deadline") or "").strip(),
+                                  responsible=afdeling,
+                                  supplementary=_people(payload) or None)
+        except oomtm_f2.F2Error as exc:
+            # "Suppl. sagsbeh." er ren information, og én person, F2 ikke kender,
+            # afviser hele kaldet. Saa proeves sagens egne felter uden.
+            if exc.status != 400 or not _people(payload):
+                raise
+            oc.log_info(f"F2 update_metadata: Suppl. sagsbeh. blev afvist ({exc.message}) "
+                        f"- opdaterer sagen uden.")
+            client.f2.update_case(sag, title=str(payload.get("title") or "").strip(),
+                                  deadline=str(payload.get("deadline") or "").strip(),
+                                  responsible=afdeling)
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"F2 update_metadata failed: {exc!r}")
-        _callback(oc, client, path, {"ok": False, "note": str(exc)[:400]})
-        raise
-    _callback(oc, client, path, {"ok": True})
+        sag_fejl = str(exc)[:400]
+
+    # Akterne ogsaa, naar sagens felter fejlede: det er dem, der giver adgang.
+    adgang = _ret_adgang(oc, client, payload)
+    _callback(oc, client, path, {"ok": not sag_fejl, "note": sag_fejl or None,
+                                 "adgang": adgang})
+    oc.log_info(f"F2 adgang: {adgang['akter']} akt(er) gennemgået, "
+                f"{len(adgang['aendret'])} rettet, {len(adgang['failed'])} fejlede.")
+    if sag_fejl or adgang["failed"]:
+        # Efter kvitteringen, som i afstemningen: det, der lykkedes, er gjort,
+        # og et nyt forsøg gentager kun resten (en akt med alle på er ingen
+        # skrivning).
+        raise RuntimeError(
+            "F2 blev ikke helt opdateret. "
+            + (f"Sagen: {sag_fejl}. " if sag_fejl else "")
+            + (f"Adgangen til {len(adgang['failed'])} akt(er): {adgang['failed']}"
+               if adgang["failed"] else ""))
 
 
 # ----- journalize_email ------------------------------------------------------
@@ -306,7 +481,19 @@ def _journalize_email(oc, client, case_id, payload):
                 f"{oomtm_f2.text(sag, 'CaseNumber')}")
     try:
         mail = _kontakt_get(client, f"/api/v1/cases/{case_id}/emails/{email_id}")
+        # Mailens svar bærer sagens adgang, som den er NU. Køelementet blev
+        # lavet tidligere - for anmodningen typisk før nogen havde taget sagen.
+        payload = _frisk(oc, client, case_id, payload, adgang=mail.get("adgang") or {})
         akt, ny = _mail_akt(oc, client, sag, mail, payload)
+        if not ny:
+            # En akt fra en tidligere kørsel: den kan mangle nogen, der er kommet
+            # på sagen siden. Mailen ER journaliseret, så det må ikke melde den
+            # som fejlet; update_metadata er stedet, der siger fra.
+            try:
+                _sikr_adgang(oc, client, akt, payload)
+            except Exception as exc:  # pylint: disable=broad-except
+                oc.log_info(f"F2 journalize_email: aktparterne på den genbrugte "
+                            f"akt kunne ikke sættes: {exc!r}")
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"F2 journalize_email failed: {exc!r}")
         _callback(oc, client, path, {"ok": False, "note": str(exc)[:400]})
@@ -517,6 +704,8 @@ def _sync_f2(oc, client, case_id, payload):
         _callback(oc, client, path, {"ok": False, "source_case_id": src or None,
                                      "note": "Sagen er endnu ikke oprettet i F2."})
         return
+    # Planen bærer sagens adgang, som den er nu (se _frisk).
+    payload = _frisk(oc, client, case_id, payload, adgang=plan.get("adgang") or {})
 
     sager = plan.get("sager") or []
     if not sager:
@@ -629,6 +818,14 @@ def _udleveringsakt(oc, client, sag, del_plan, payload):
         try:
             akt = client.f2.get(client.f2.rel("matter-by-id").replace("{id}", kendt))
             if not client.f2.locked(akt):
+                # Fra en tidligere kørsel - den kan mangle nogen, der er kommet
+                # på sagen siden. Lykkes det ikke, må det ikke stoppe selve
+                # udleveringen; update_metadata prøver igen.
+                try:
+                    _sikr_adgang(oc, client, akt, payload)
+                except Exception as exc:  # pylint: disable=broad-except
+                    oc.log_info(f"F2 sync: aktparterne på akt {kendt} kunne "
+                                f"ikke sættes: {exc!r}")
                 return akt
             oc.log_info(f"F2 sync: akt {kendt} er låst, så dokumenter kan ikke "
                         f"fjernes fra den - lægger en ny akt på {src}.")
