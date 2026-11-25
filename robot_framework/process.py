@@ -349,17 +349,33 @@ def _create_case(oc, client, case_id, payload):
     # Hvem der er på sagen NU - ikke da den blev sat i kø. Den kan være taget
     # i mellemtiden.
     payload = _frisk(oc, client, case_id, payload)
+    felter = {
+        "title": title,
+        "external_id": ekstern,
+        "responsible": _unit(client, payload),
+        "deadline": str(payload.get("deadline") or "").strip(),
+        "cpr": str(payload.get("cpr") or "").strip(),
+    }
+    folk = _people(payload)
     try:
-        sag, ny = client.f2.create_case(
-            title=title,
-            external_id=ekstern,
-            responsible=_unit(client, payload),
-            deadline=str(payload.get("deadline") or "").strip(),
-            cpr=str(payload.get("cpr") or "").strip(),
-            # Rent oplysende - feltet "Suppl. sagsbeh." et menneske kigger i.
+        try:
+            # Suppl. sagsbeh. er rent oplysende - feltet et menneske kigger i.
             # Det giver INGEN adgang; det er maalt. Adgangen ligger paa akterne.
-            supplementary=_people(payload) or None,
-        )
+            sag, ny = client.f2.create_case(**felter, supplementary=folk or None)
+        except oomtm_f2.F2Error as exc:
+            # Fundet 2026-11-25 i F2-test: "Only F2 users are allowed as
+            # supplementary caseworkers." Én på sagen, som ikke er bruger i F2,
+            # og HELE sagen blev ikke oprettet - og så kunne intet på den
+            # journaliseres, heller ikke anmodningen eller et afslag. Et felt,
+            # der ikke giver adgang, maa ikke kunne standse det. Et afvist kald
+            # opretter intet, og create_case henter en ny engangs-URL, saa et
+            # forsoeg uden feltet kan ikke give to sager.
+            if exc.status != 400 or not folk:
+                raise
+            oc.log_info(f"F2 create_case: Suppl. sagsbeh. blev afvist ({exc.message}) - "
+                        f"en af dem er ikke bruger i F2: "
+                        f"{', '.join(m for m, _ in _folk(payload))}. Opretter sagen uden.")
+            sag, ny = client.f2.create_case(**felter)
     except Exception as exc:  # pylint: disable=broad-except
         oc.log_info(f"F2 create_case failed: {exc!r}")
         _callback(oc, client, path, {"ok": False, "note": str(exc)[:400]})
